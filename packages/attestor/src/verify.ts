@@ -33,6 +33,9 @@ import {
   type RekorEntry,
 } from './rekor.ts';
 
+/** Maximum clock skew tolerance between local entry ts and Rekor integratedTime (5 minutes). */
+export const MAX_ANCHOR_CLOCK_SKEW_SEC = 300;
+
 export interface TamperFinding {
   seq: number;
   check: 'CHAIN' | 'MERKLE' | 'SIG' | 'ANCHOR' | 'ANCHOR-ONLINE';
@@ -632,6 +635,26 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
     } else {
       // digest matched our recomputed checkpoint, but nothing authenticates it
       unauthenticated++;
+    }
+
+    // Verify Rekor integratedTime: trusted anchor timestamp must not be in the past
+    // relative to any entry it covers (with clock skew tolerance).
+    if (typeof stored.integratedTime === 'number' && stored.integratedTime > 0) {
+      const anchorTimeSec = stored.integratedTime;
+      const coveredTreeSize = payload.tree_size;
+      const covered = entries.slice(0, coveredTreeSize);
+      for (const e of covered) {
+        const entryTimeSec = Math.floor(new Date(e.ts).getTime() / 1000);
+        if (entryTimeSec > anchorTimeSec + MAX_ANCHOR_CLOCK_SKEW_SEC) {
+          findings.push({
+            seq: e.seq,
+            check: 'ANCHOR',
+            reason: `entry ${e.seq} timestamp (${e.ts}) is later than covering Rekor anchor ${a.seq} integratedTime (${new Date(anchorTimeSec * 1000).toISOString()}) by more than ${MAX_ANCHOR_CLOCK_SKEW_SEC}s tolerance`,
+          });
+          anchorFailures++;
+          break;
+        }
+      }
     }
   }
   // Stored-anchor sweep — driven by the FILES on disk, never by what the

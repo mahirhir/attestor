@@ -8,12 +8,13 @@ import { join } from 'node:path';
 import { generateKeyPairSync, sign as cryptoSign, createHash } from 'node:crypto';
 import canonicalize from 'canonicalize';
 import { verifyLedger } from '../src/verify.ts';
-import { coreOf, canonicalCoreBytes, hashCore, signCore, genesisPrev, payloadHash, type LedgerEntry } from '../src/ledger.ts';
+import { coreOf, canonicalCoreBytes, hashCore, signCore, genesisPrev, payloadHash, Ledger, type LedgerEntry } from '../src/ledger.ts';
 import { buildPack } from '../src/export.ts';
-import { keyIdOf } from '../src/keys.ts';
+import { keyIdOf, generateKey } from '../src/keys.ts';
 import { hashedRekordBody } from '../src/rekor.ts';
 import { leafHash, merkleRoot } from '../src/merkle.ts';
-import { buildAnchoredLedger, fakeRekor, rekorEntryFor } from './helpers.ts';
+import { writeCheckpoint } from '../src/checkpoint.ts';
+import { buildAnchoredLedger, fakeRekor, fakeAnchor, rekorEntryFor, tmp } from './helpers.ts';
 
 function readLines(ledgerDir: string): string[] {
   return readFileSync(join(ledgerDir, 'ledger.jsonl'), 'utf8').trimEnd().split('\n');
@@ -507,4 +508,39 @@ test('--expect-key binds a ledger to a recorder identity the auditor knows', asy
   // a PEM works as well as a key id
   const byPem = await verifyLedger(ledgerDir, { expectKeyId: keys.publicPem });
   assert.equal(byPem.exitCode, 0, JSON.stringify(byPem.findings));
+});
+
+test('entry timestamp in the future relative to Rekor integratedTime: exit 1 ANCHOR tamper', async () => {
+  const dir = tmp();
+  const ledgerDir = join(dir, 'ledger');
+  process.env.ATTESTOR_HOME = join(dir, 'home');
+  const keys = generateKey(join(dir, 'home'));
+  const ledger = Ledger.open(ledgerDir, keys);
+  const rekor = fakeRekor();
+
+  // Append entry with future timestamp
+  ledger.append({
+    type: 'call_request',
+    origin: 'proxy',
+    call_id: 'call-future',
+    tool: { server: 'toy', name: 'echo' },
+    payload: JSON.stringify({ text: 'future call' }),
+  });
+  
+  // Directly manipulate the appended entry to have a future timestamp and re-sign
+  const lines = readLines(ledgerDir);
+  const e = JSON.parse(lines[1]!) as LedgerEntry;
+  e.ts = '2035-01-01T00:00:00.000Z';
+  e.sig = signCore(e, keys.privateKey);
+  lines[1] = JSON.stringify(e);
+  writeLines(ledgerDir, lines);
+
+  // Now write checkpoint and anchor
+  const ckpt = writeCheckpoint(ledger);
+  fakeAnchor(ledger, ckpt, rekor);
+  ledger.close();
+
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 1);
+  assert.ok(report.findings.some((f) => f.check === 'ANCHOR' && /is later than covering Rekor anchor/.test(f.reason)));
 });
