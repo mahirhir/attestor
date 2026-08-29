@@ -21,6 +21,7 @@ Usage:
   attestor keys list                             list recorder keys (active last)
   attestor keys rotate --ledger <dir>            rotate: new key signed into the chain by the old one
   attestor wrap [opts] -- <server command...>    record an MCP stdio server
+  attestor proxy --target <url> [opts]           record an MCP Streamable HTTP server (reverse proxy)
   attestor install [--config <file>] [--dry-run] wrap every server in .mcp.json / Claude Desktop config
   attestor verify <dir> [--online] [--entry N] [--json]
                         [--rekor-pubkey <f>] [--rekor-url <u>]   authenticate anchors with a key you trust
@@ -321,6 +322,44 @@ async function cmdDemo(argv: string[]): Promise<void> {
   await runDemo(argv);
 }
 
+async function cmdProxy(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      target: { type: 'string' },
+      listen: { type: 'string' },
+      ledger: { type: 'string' },
+      'on-error': { type: 'string' },
+    },
+  });
+  if (!values.target) {
+    fail('usage: attestor proxy --target <url> [--listen <host:port>] [--ledger <dir>]');
+  }
+  const { createHttpProxyServer } = await import('./proxy_http.ts');
+  const dir = values.ledger ?? defaultLedgerDir();
+  const keys = loadOrInitKeys();
+  const ledger = Ledger.open(dir, keys);
+  const proxy = createHttpProxyServer({
+    target: values.target,
+    ledger,
+    onError: values['on-error'] === 'continue' ? 'continue' : 'block',
+  });
+  const listenVal = values.listen ?? '127.0.0.1:9464';
+  let host = '127.0.0.1';
+  let port = 9464;
+  if (listenVal.includes(':')) {
+    const parts = listenVal.split(':');
+    host = parts[0]!;
+    port = Number(parts[1]);
+  } else if (/^\d+$/.test(listenVal)) {
+    port = Number(listenVal);
+  }
+  proxy.server.listen(port, host, () => {
+    process.stderr.write(`[attestor] Streamable HTTP proxy listening on http://${host}:${port} -> ${values.target}\n`);
+    process.stderr.write(`[attestor] recording audit ledger to ${dir}\n`);
+  });
+}
+
 // ---------------- dispatch ----------------
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -331,6 +370,9 @@ try {
       break;
     case 'wrap':
       await cmdWrap(rest);
+      break;
+    case 'proxy':
+      await cmdProxy(rest);
       break;
     case 'install':
       await cmdInstall(rest);
