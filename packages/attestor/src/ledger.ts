@@ -38,7 +38,8 @@ export type EntryType =
   | 'checkpoint'
   | 'anchor'
   | 'gap'
-  | 'key_rotation';
+  | 'key_rotation'
+  | 'redaction';
 
 export type Origin = 'proxy' | 'sdk' | 'manual' | 'system';
 
@@ -53,6 +54,7 @@ export const SYSTEM_TYPES: ReadonlySet<EntryType> = new Set([
   'anchor',
   'key_rotation',
   'gap',
+  'redaction',
 ]);
 
 export interface SignedCore {

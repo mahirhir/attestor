@@ -273,6 +273,21 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
 
   const recomputed: string[] = [];
   let redactedCount = 0;
+  let attestedRedactions = 0;
+  let unattestedRedactions = 0;
+
+  const redactionCertificates = new Map<number, { seq: number; reason?: string }>();
+  for (const e of entries) {
+    if (e.type === 'redaction' && e.payload) {
+      try {
+        const p = JSON.parse(e.payload) as { target_seq?: number; reason?: string };
+        if (typeof p.target_seq === 'number') {
+          redactionCertificates.set(p.target_seq, { seq: e.seq, reason: p.reason });
+        }
+      } catch {}
+    }
+  }
+
   let prev = ledgerId !== undefined ? genesisPrev(ledgerId) : undefined;
   for (let i = 0; i < n; i++) {
     const e = entries[i]!;
@@ -345,7 +360,7 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
         reason: `entry ${i} is a ${e.type} entry whose payload was blanked (system payloads are load-bearing)`,
       });
     } else if (SYSTEM_TYPES.has(e.type)) {
-      // genesis/checkpoint/anchor/key_rotation/gap payloads are load-bearing —
+      // genesis/checkpoint/anchor/key_rotation/gap/redaction payloads are load-bearing —
       // a missing one is tamper, not a legitimate redaction.
       findings.push({
         seq: i,
@@ -354,6 +369,11 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
       });
     } else if (e.type !== 'session_end') {
       redactedCount++;
+      if (redactionCertificates.has(e.seq)) {
+        attestedRedactions++;
+      } else {
+        unattestedRedactions++;
+      }
     }
     prev = h;
   }
@@ -364,7 +384,15 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
     lines: chainOk
       ? [
           `${n.toLocaleString('en-US')} entries, hash chain intact` +
-            (redactedCount > 0 ? ` (${redactedCount} redacted payload${redactedCount === 1 ? '' : 's'})` : '') +
+            (redactedCount > 0
+              ? ` (${redactedCount} redacted payload${redactedCount === 1 ? '' : 's'}${
+                  attestedRedactions > 0 && unattestedRedactions === 0
+                    ? ': all in-chain attested'
+                    : attestedRedactions > 0
+                      ? `: ${attestedRedactions} attested, ${unattestedRedactions} unattested`
+                      : ''
+                })`
+              : '') +
             (tornTailBytes > 0 ? ` — ${tornTailBytes}-byte crash-torn partial tail ignored` : ''),
         ]
       : findingLines(findings, 'CHAIN'),

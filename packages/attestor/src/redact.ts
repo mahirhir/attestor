@@ -8,9 +8,24 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
-import { SYSTEM_TYPES, type LedgerEntry } from './ledger.ts';
+import type { KeyPair } from './keys.ts';
+import { attestorHome, loadKey } from './keys.ts';
+import { Ledger, SYSTEM_TYPES, type LedgerEntry } from './ledger.ts';
 
-export function redactEntry(ledgerDir: string, seq: number): LedgerEntry {
+export interface RedactOptions {
+  reason?: string;
+  keys?: KeyPair;
+  recordInChain?: boolean;
+}
+
+export interface RedactionRecordPayload {
+  target_seq: number;
+  target_hash?: string;
+  redacted_at: string;
+  reason?: string;
+}
+
+export function redactEntry(ledgerDir: string, seq: number, opts: RedactOptions = {}): LedgerEntry {
   const path = join(ledgerDir, 'ledger.jsonl');
   if (!existsSync(path)) throw new Error(`no ledger at ${ledgerDir}`);
   const lockPath = join(ledgerDir, 'ledger.lock');
@@ -47,17 +62,52 @@ export function redactEntry(ledgerDir: string, seq: number): LedgerEntry {
   const tmpPath = path + '.redact-tmp';
   writeFileSync(tmpPath, lines.join('\n') + '\n');
   renameSync(tmpPath, path);
+
+  // If keys are provided or found in home, append an in-chain redaction certificate
+  if (opts.recordInChain !== false) {
+    let keys = opts.keys;
+    if (!keys) {
+      try {
+        keys = loadKey(attestorHome());
+      } catch {
+        /* no default key, skip auto in-chain record */
+      }
+    }
+    if (keys) {
+      const ledger = Ledger.open(ledgerDir, keys);
+      const payload: RedactionRecordPayload = {
+        target_seq: seq,
+        target_hash: entry.entry_hash,
+        redacted_at: new Date().toISOString(),
+        reason: opts.reason ?? 'redacted by operator',
+      };
+      ledger.append({
+        type: 'redaction',
+        origin: 'system',
+        payload: JSON.stringify(payload),
+        session_id: entry.session_id,
+      });
+      ledger.close();
+    }
+  }
+
   return entry;
 }
 
 export async function runRedact(argv: string[]): Promise<void> {
-  const { positionals } = parseArgs({ args: argv, allowPositionals: true, options: {} });
+  const { positionals, values } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      reason: { type: 'string', short: 'r' },
+    },
+  });
   const [dir, seqStr] = positionals;
   if (dir === undefined || seqStr === undefined || !/^\d+$/.test(seqStr)) {
-    process.stderr.write('attestor: usage: attestor redact <ledger-dir> <seq>\n');
+    process.stderr.write('attestor: usage: attestor redact <ledger-dir> <seq> [--reason <reason>]\n');
     process.exit(2);
   }
-  const entry = redactEntry(dir, Number(seqStr));
+  const entry = redactEntry(dir, Number(seqStr), { reason: values.reason });
   process.stdout.write(
     `redacted payload of entry ${entry.seq} (${entry.type})\n` +
       `  salted commitment retained: ${entry.payload_hash}\n` +

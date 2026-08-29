@@ -85,3 +85,22 @@ test('redact refuses system entries and double-redaction', async () => {
   redactEntry(ledgerDir, wire.seq);
   assert.throws(() => redactEntry(ledgerDir, wire.seq), /already redacted/);
 });
+
+test('redact appends in-chain redaction entry and verify reports attested', async () => {
+  const { ledgerDir, keys } = buildAnchoredLedger();
+  const before = readEntries(join(ledgerDir, 'ledger.jsonl'));
+  const target = before.find((e) => e.payload?.includes('100.00'))!;
+  redactEntry(ledgerDir, target.seq, { reason: 'GDPR right to be forgotten', keys });
+
+  const after = readEntries(join(ledgerDir, 'ledger.jsonl'));
+  const cert = after.find((e) => e.type === 'redaction');
+  assert.ok(cert, 'in-chain redaction certificate must be recorded');
+  const payload = JSON.parse(cert.payload!) as { target_seq: number; reason: string };
+  assert.equal(payload.target_seq, target.seq);
+  assert.equal(payload.reason, 'GDPR right to be forgotten');
+
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 0);
+  const chainLine = report.checks.find((c) => c.name === 'CHAIN')?.lines[0];
+  assert.ok(chainLine?.includes('all in-chain attested'));
+});
