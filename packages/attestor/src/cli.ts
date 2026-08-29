@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// attestor CLI: keys, wrap, install, verify, export, redact, replay, demo.
+// attestor CLI: keys, wrap, install, verify, export, redact, replay, demo, doctor.
 import { parseArgs } from 'node:util';
 import { existsSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
@@ -16,6 +16,7 @@ import { attestorInvocation, claudeDesktopConfigPaths, wrapConfig, type McpServe
 const USAGE = `attestor — tamper-evident flight recorder for AI agents
 
 Usage:
+  attestor doctor                                diagnose environment, keys, configs, Rekor
   attestor setup [--yes] [--config <f>]          guided install: key + wrap your MCP servers
   attestor keys init [--passphrase-file <f>]     generate a P-256 recorder key
   attestor keys list                             list recorder keys (active last)
@@ -263,7 +264,7 @@ async function cmdReplay(argv: string[]): Promise<void> {
   // every session, so a bare call_id would pair a result with another
   // session's request. Walk in order and consume each request once.
   const requests = new Map<string, LedgerEntry>();
-  const key = (e: LedgerEntry) => `${e.session_id} ${e.call_id}`;
+  const key = (e: LedgerEntry) => `${e.session_id} ${e.call_id}`;
   for (const e of entries) {
     if (e.type === 'call_request' && e.call_id !== undefined && !requests.has(key(e))) {
       requests.set(key(e), e);
@@ -321,11 +322,20 @@ async function cmdDemo(argv: string[]): Promise<void> {
   await runDemo(argv);
 }
 
+async function cmdDoctor(argv: string[]): Promise<void> {
+  const { runDoctor } = await import('./doctor.ts');
+  const code = await runDoctor(argv);
+  process.exit(code);
+}
+
 // ---------------- dispatch ----------------
 
 const [cmd, ...rest] = process.argv.slice(2);
 try {
   switch (cmd) {
+    case 'doctor':
+      await cmdDoctor(rest);
+      break;
     case 'keys':
       await cmdKeys(rest);
       break;
