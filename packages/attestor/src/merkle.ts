@@ -38,6 +38,62 @@ export function merkleRoot(leaves: readonly Buffer[]): Buffer {
   return nodeHash(merkleRoot(leaves.slice(0, k)), merkleRoot(leaves.slice(k)));
 }
 
+/**
+ * Incremental RFC 6962 Merkle tree.
+ * Maintains the O(log N) right-hand frontier of perfect binary subtrees.
+ * Appending is O(1) amortized, and root computation is O(log N).
+ */
+export class IncrementalMerkleTree {
+  private count = 0;
+  private frontier: (Buffer | undefined)[] = [];
+
+  constructor() {}
+
+  get size(): number {
+    return this.count;
+  }
+
+  append(leafData: Buffer): void {
+    let current = leafHash(leafData);
+    let index = 0;
+    let c = this.count;
+
+    while (c % 2 === 1) {
+      const left = this.frontier[index];
+      if (left !== undefined) {
+        current = nodeHash(left, current);
+        this.frontier[index] = undefined;
+      }
+      c = Math.floor(c / 2);
+      index++;
+    }
+
+    this.frontier[index] = current;
+    this.count++;
+  }
+
+  root(): Buffer {
+    if (this.count === 0) return sha256();
+
+    const activeRoots: Buffer[] = [];
+    for (let i = 0; i < this.frontier.length; i++) {
+      const f = this.frontier[i];
+      if (f !== undefined) {
+        activeRoots.push(f);
+      }
+    }
+
+    if (activeRoots.length === 0) return sha256();
+    if (activeRoots.length === 1) return activeRoots[0]!;
+
+    let r = activeRoots[0]!;
+    for (let i = 1; i < activeRoots.length; i++) {
+      r = nodeHash(activeRoots[i]!, r);
+    }
+    return r;
+  }
+}
+
 /** RFC 6962 §2.1.1 PATH(m, D[n]) — audit path for leaf m, bottom-up. */
 export function inclusionProof(m: number, leaves: readonly Buffer[]): Buffer[] {
   const n = leaves.length;
