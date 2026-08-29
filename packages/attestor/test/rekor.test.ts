@@ -19,8 +19,10 @@ import {
   postEntry,
   readPending,
   retryPending,
+  UntrustedRekorKeyError,
   verifyCheckpointNote,
   verifyRekorInclusion,
+  verifyRekorKeyTrust,
   verifySET,
   type RekorEntry,
 } from '../src/rekor.ts';
@@ -350,4 +352,20 @@ test('live Rekor smoke: post + fetch + SET verify', { skip: process.env.ATTESTOR
   assert.equal(fetched.body, entry.body);
   assert.ok(verifySET(fetched, fixture.rekor_log_public_key_pem));
   assert.ok(verifyRekorInclusion(fetched));
+});
+
+test('verifyRekorKeyTrust passes for official Sigstore Rekor log key', () => {
+  assert.doesNotThrow(() => {
+    verifyRekorKeyTrust('https://rekor.sigstore.dev', fixture.rekor_log_public_key_pem);
+  });
+});
+
+test('verifyRekorKeyTrust throws UntrustedRekorKeyError for unknown key targeting official Sigstore', () => {
+  const fakeKeyPem = generateKey(tmp()).publicPem;
+  assert.throws(
+    () => {
+      verifyRekorKeyTrust('https://rekor.sigstore.dev', fakeKeyPem);
+    },
+    UntrustedRekorKeyError,
+  );
 });

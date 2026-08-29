@@ -25,6 +25,34 @@ import { leafHash, rootFromInclusion } from './merkle.ts';
 
 export const DEFAULT_REKOR_URL = 'https://rekor.sigstore.dev';
 
+export class UntrustedRekorKeyError extends Error {}
+
+/**
+ * Pinned SHA-256 SPKI log IDs for official Sigstore Rekor instances
+ * (matches logID: sha256(spki_der)).
+ */
+export const KNOWN_SIGSTORE_REKOR_LOG_IDS: readonly string[] = [
+  'c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d', // Sigstore active v1 log
+];
+
+/** Compute RFC 6962 / Sigstore log ID: sha256(SPKI DER). */
+export function getSpkiFingerprint(pem: string): string {
+  const key = createPublicKey(pem);
+  const der = key.export({ type: 'spki', format: 'der' });
+  return createHash('sha256').update(der).digest('hex');
+}
+
+/** Verify log public key matches pinned Sigstore trust root when targeting public Sigstore Rekor. */
+export function verifyRekorKeyTrust(baseUrl: string, pem: string): void {
+  const fingerprint = getSpkiFingerprint(pem);
+  const isSigstoreOfficial = baseUrl.trim().replace(/\/+$/, '') === DEFAULT_REKOR_URL || baseUrl.includes('rekor.sigstore.dev');
+  if (isSigstoreOfficial && !KNOWN_SIGSTORE_REKOR_LOG_IDS.includes(fingerprint)) {
+    throw new UntrustedRekorKeyError(
+      `Untrusted Rekor public key for ${baseUrl}: SPKI digest ${fingerprint} does not match any pinned Sigstore trust root key.`,
+    );
+  }
+}
+
 /** Bound every Rekor request so exit-time anchor flushes can never hang. */
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -342,6 +370,7 @@ export async function pinRekorKey(baseUrl: string, ledgerDir: string, home?: str
   const local = join(anchorsDir(ledgerDir), 'rekor-pub.pem');
   if (existsSync(local)) return;
   const pem = await getLogPublicKey(baseUrl);
+  verifyRekorKeyTrust(baseUrl, pem);
   mkdirSync(anchorsDir(ledgerDir), { recursive: true });
   writeFileSync(local, pem);
   const homeKeys = keysDir(home ?? attestorHome());
