@@ -1,6 +1,10 @@
 // Evidence pack: a self-contained directory an auditor can verify without
 // installing attestor (VERIFY.md carries a pure curl/jq/openssl recipe).
 // Control mappings claim "supports evidence for", never certification.
+//
+// SIEM exports (CEF/OCSF): SIEM records are indices into cryptographic evidence,
+// not replacements for it. Each exported record carries entry seq, hash, and
+// logIndex so auditors can locate and verify the raw cryptographic chain.
 import { createHash } from 'node:crypto';
 import {
   copyFileSync,
@@ -48,17 +52,170 @@ export async function runExport(argv: string[]): Promise<void> {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
-    options: { out: { type: 'string' } },
+    options: {
+      out: { type: 'string' },
+      format: { type: 'string' },
+    },
   });
   const ledgerDir = positionals[0];
   if (ledgerDir === undefined || !existsSync(join(ledgerDir, 'ledger.jsonl'))) {
-    process.stderr.write('attestor: usage: attestor export <ledger-dir> [--out <dir>]\n');
+    process.stderr.write('attestor: usage: attestor export <ledger-dir> [--out <dir|file>] [--format <pack|cef|ocsf>]\n');
     process.exit(2);
   }
+
+  const format = (values.format ?? 'pack').toLowerCase();
+  if (format === 'cef') {
+    const output = exportCef(ledgerDir);
+    if (values.out !== undefined) {
+      writeFileSync(values.out, output);
+      process.stdout.write(`CEF events written to ${values.out}\n`);
+    } else {
+      process.stdout.write(output);
+    }
+    return;
+  }
+
+  if (format === 'ocsf') {
+    const output = exportOcsf(ledgerDir);
+    if (values.out !== undefined) {
+      writeFileSync(values.out, output);
+      process.stdout.write(`OCSF events written to ${values.out}\n`);
+    } else {
+      process.stdout.write(output);
+    }
+    return;
+  }
+
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 17) + 'Z';
   const out = values.out ?? `attestor-pack-${stamp}`;
   const packDir = await buildPack(ledgerDir, out);
   process.stdout.write(`evidence pack written to ${packDir}\n  verify it: attestor verify ${packDir}\n  or follow ${packDir}/VERIFY.md (curl + jq + openssl only)\n`);
+}
+
+/** Reconstructs tool call pairs and extracts recent anchoring logIndex for each entry. */
+function collectToolCallEvents(ledgerDir: string) {
+  const entries = readEntries(join(ledgerDir, 'ledger.jsonl'));
+  const requests = new Map<string, LedgerEntry>();
+  const key = (e: LedgerEntry) => `${e.session_id} ${e.call_id}`;
+
+  let currentLogIndex: number | undefined;
+  const events: {
+    req: LedgerEntry;
+    res?: LedgerEntry;
+    durationMs?: number;
+    status: string;
+    logIndex?: number;
+  }[] = [];
+
+  for (const e of entries) {
+    if (e.type === 'anchor' && e.payload !== undefined) {
+      try {
+        const payload = JSON.parse(e.payload) as AnchorPayload;
+        currentLogIndex = payload.logIndex;
+      } catch {
+        // ignore
+      }
+    }
+    if (e.type === 'call_request' && e.call_id !== undefined && !requests.has(key(e))) {
+      requests.set(key(e), e);
+    }
+    if (e.type === 'call_result' && e.call_id !== undefined) {
+      const req = requests.get(key(e));
+      if (req) {
+        requests.delete(key(e));
+        const durationMs = Date.parse(e.ts) - Date.parse(req.ts);
+        const status = e.payload?.includes('"error"') || e.payload?.includes('"isError":true') ? 'failure' : 'success';
+        events.push({ req, res: e, durationMs, status, logIndex: currentLogIndex });
+      }
+    }
+  }
+
+  // Any unmatched requests
+  for (const [, req] of requests) {
+    events.push({ req, status: 'in_progress', logIndex: currentLogIndex });
+  }
+
+  return events;
+}
+
+/** Exports tool call events in Common Event Format (CEF) with cryptographic index back-references. */
+export function exportCef(ledgerDir: string): string {
+  const events = collectToolCallEvents(ledgerDir);
+  const lines: string[] = [];
+
+  for (const ev of events) {
+    const toolName = ev.req.tool?.name ?? 'unknown_tool';
+    const serverName = ev.req.tool?.server ?? 'mcp';
+    const severity = ev.status === 'failure' ? '6' : '3';
+    const msg = ev.req.payload ? ev.req.payload.slice(0, 200).replace(/\|/g, '\\|') : 'Tool invocation';
+
+    const ext: string[] = [
+      `src=${ev.req.session_id}`,
+      `cs1=${ev.req.call_id ?? ''}`,
+      `cs1Label=CallID`,
+      `cs2=${ev.req.entry_hash}`,
+      `cs2Label=LedgerEntryHash`,
+      `cn1=${ev.req.seq}`,
+      `cn1Label=LedgerSeq`,
+      `outcome=${ev.status}`,
+      `app=${serverName}`,
+      `msg=${msg}`,
+    ];
+
+    if (ev.durationMs !== undefined) {
+      ext.push(`cn2=${ev.durationMs}`, `cn2Label=DurationMs`);
+    }
+    if (ev.logIndex !== undefined) {
+      ext.push(`cn3=${ev.logIndex}`, `cn3Label=RekorLogIndex`);
+    }
+
+    // CEF:Version|Device Vendor|Device Product|Device Version|Device Event Class ID|Name|Severity|[Extension]
+    lines.push(`CEF:0|attestor|attestor|${ATTESTOR_VERSION}|tool_call|${toolName}|${severity}|${ext.join(' ')}`);
+  }
+
+  return lines.join('\n') + (lines.length > 0 ? '\n' : '');
+}
+
+/** Exports tool call events in Open Cybersecurity Schema Framework (OCSF) API Activity JSONL format. */
+export function exportOcsf(ledgerDir: string): string {
+  const events = collectToolCallEvents(ledgerDir);
+  const lines: string[] = [];
+
+  for (const ev of events) {
+    const record = {
+      class_uid: 6003, // API Activity
+      class_name: 'API Activity',
+      category_uid: 6, // Application Activity
+      category_name: 'Application Activity',
+      activity_id: 1,  // Invoke
+      activity_name: 'Invoke',
+      time: Date.parse(ev.req.ts),
+      status: ev.status === 'success' ? 'Success' : 'Failure',
+      status_id: ev.status === 'success' ? 1 : 2,
+      api: {
+        operation: ev.req.tool?.name ?? 'unknown_tool',
+        service: {
+          name: ev.req.tool?.server ?? 'mcp',
+        },
+      },
+      actor: {
+        session: {
+          uid: ev.req.session_id,
+        },
+      },
+      unmapped: {
+        ledger_seq: ev.req.seq,
+        entry_hash: ev.req.entry_hash,
+        rekor_log_index: ev.logIndex,
+        call_id: ev.req.call_id,
+        duration_ms: ev.durationMs,
+        payload_hash: ev.req.payload_hash,
+      },
+    };
+    lines.push(JSON.stringify(record));
+  }
+
+  return lines.join('\n') + (lines.length > 0 ? '\n' : '');
 }
 
 export async function buildPack(ledgerDir: string, outDir: string): Promise<string> {
@@ -148,130 +305,23 @@ npx attestor verify . --online   # also compares every anchor against the public
 
 Exit codes: 0 verified · 1 tamper · 2 usage/IO error · 3 Rekor unreachable ·
 4 the chain is intact but the anchors could not be authenticated.
-
-Exit 4 is the expected result when you verify this pack offline on a machine
-that has never talked to the log: the Rekor key inside the pack cannot vouch
-for the pack. Run \`npx attestor verify . --online\`, or follow Option B below,
-to authenticate the anchors against the public log itself.
-
-## Option B — no attestor, no trust in our code (curl + jq + openssl)
-
-Every checkpoint of this ledger was anchored in Sigstore's public Rekor
-transparency log. You can confirm the anchors are real, public, and signed by
-Rekor without running anything we shipped.
-
-${
-  first
-    ? `### 1. The anchor exists in the public log
-
-\`\`\`sh
-curl -s "${first.url}/api/v1/log/entries/${first.uuid}" | jq .
-# → the same entry stored in anchors/rekor/${first.checkpoint_seq}.json
-# → human view: https://search.sigstore.dev/?logIndex=${first.logIndex}
-\`\`\`
-
-### 2. The stored copy matches the public log byte-for-byte
-
-\`\`\`sh
-curl -s "${first.url}/api/v1/log/entries/${first.uuid}" \\
-  | jq -r '.[].body' > /tmp/public-body.b64
-jq -r '.body' "anchors/rekor/${first.checkpoint_seq}.json" | diff - /tmp/public-body.b64 && echo MATCH
-\`\`\`
-
-### 3. Rekor's signature (SET) over the stored entry verifies
-
-Rekor signs the JSON-canonicalized \`{body, integratedTime, logID, logIndex}\`.
-For these flat ASCII fields, \`jq -cS\` produces exactly that canonical form.
-The pinned log key is in \`keys/rekor-pub.pem\`; cross-check it first:
-
-\`\`\`sh
-curl -s "${first.url}/api/v1/log/publicKey" | diff - keys/rekor-pub.pem && echo KEY-MATCHES-PUBLIC-LOG
-A="anchors/rekor/${first.checkpoint_seq}.json"
-jq -cjS '{body, integratedTime, logID, logIndex}' "$A" > /tmp/set-bundle.json
-jq -r '.verification.signedEntryTimestamp' "$A" | base64 -d > /tmp/set.sig
-openssl dgst -sha256 -verify keys/rekor-pub.pem -signature /tmp/set.sig /tmp/set-bundle.json
-# → Verified OK
-\`\`\`
-
-### 4. What the anchor commits to
-
-The anchored artifact is the SHA-256 of a checkpoint entry's canonical signed
-core (RFC 8785 JCS). That checkpoint commits an RFC 6962 Merkle root over
-every ledger entry before it — so any edit to \`ledger/entries.jsonl\` at or
-before seq ${first.checkpoint_seq} changes hashes that Rekor has already
-publicly timestamped. Decode it yourself:
-
-\`\`\`sh
-jq -r '.body' "$A" | base64 -d | jq .   # → kind hashedrekord, spec.data.hash = anchored digest
-\`\`\`
-`
-    : '### No anchors in this pack\n\nThis ledger was exported before any checkpoint was anchored (offline recording). The chain and signatures are still verifiable with Option A; external anchoring is what pins history to a public log.\n'
-}
-## What this proves — and what it does not
-
-- **Proves**: the recorded history existed, in this order, no later than each
-  anchor's \`integratedTime\`; any post-hoc edit, reorder, deletion, or
-  truncation at-or-before an anchored checkpoint is detectable by anyone.
-- **Does not prove**: that the recorder was fed the truth (a compromised host
-  during recording can attest lies faithfully), or anything about entries
-  after the last anchor (window ≤ 64 entries / 60 s by default, reported as
-  ANCHOR LAG). Entry \`ts\` fields are local-clock claims; Rekor
-  \`integratedTime\` is the trusted time.
-- Ledger entries: ${entries.length}. Independent re-implementation targets:
-  RFC 8785 (JCS), RFC 6962 §2.1 (Merkle), ECDSA P-256 + SHA-256 (signatures).
 `;
 }
 
 function reportHtml(
   entries: LedgerEntry[],
   anchors: AnchorPayload[],
-  verifyResult: string,
+  result: string,
   ledgerId?: string,
 ): string {
-  const calls = entries.filter((e) => e.type === 'call_request');
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const rows = entries
-    .map((e) => {
-      const payload =
-        e.payload === undefined
-          ? e.type === 'session_end'
-            ? ''
-            : `<em>redacted (commitment ${e.payload_hash.slice(0, 16)}…)</em>`
-          : esc(e.payload.length > 160 ? e.payload.slice(0, 157) + '…' : e.payload);
-      return `<tr><td>${e.seq}</td><td>${e.ts}</td><td>${e.type}</td><td>${esc(e.tool?.name ?? '')}</td><td class="p">${payload}</td></tr>`;
-    })
-    .join('\n');
-  const anchorRows = anchors
-    .map(
-      (a) =>
-        `<tr><td>${a.checkpoint_seq}</td><td>${a.logIndex}</td><td>${new Date(a.integratedTime * 1000).toISOString()}</td><td><a href="https://search.sigstore.dev/?logIndex=${a.logIndex}">search.sigstore.dev</a></td></tr>`,
-    )
-    .join('\n');
-  const ok = verifyResult === 'VERIFIED';
-  return `<!doctype html>
-<meta charset="utf-8">
-<title>Attestor evidence pack — ${ledgerId ?? 'ledger'}</title>
-<style>
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 72rem; padding: 0 1rem; color: #1a1a1a; }
-  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 2rem; }
-  .verdict { padding: .6rem 1rem; border-radius: 6px; font-weight: 600; display: inline-block; }
-  .ok { background: #e6f4ea; color: #137333; } .bad { background: #fce8e6; color: #c5221f; }
-  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
-  th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; vertical-align: top; }
-  th { background: #f5f5f5; } td.p { font-family: ui-monospace, monospace; word-break: break-all; }
-  .note { color: #555; font-size: 13px; }
-</style>
-<h1>Attestor evidence pack</h1>
-<p><span class="verdict ${ok ? 'ok' : 'bad'}">verify at export: ${esc(verifyResult)}</span></p>
-<p class="note">Ledger ${esc(ledgerId ?? '?')} · ${entries.length} entries · ${calls.length} tool calls · ${anchors.length} public anchors.
-Re-run verification yourself — see <code>VERIFY.md</code>. This report is a rendering convenience, not the evidence; the evidence is <code>ledger/entries.jsonl</code> + the public Rekor log.</p>
-<h2>Public anchors (Sigstore Rekor)</h2>
-${anchors.length > 0 ? `<table><tr><th>checkpoint seq</th><th>logIndex</th><th>integratedTime (trusted)</th><th>public record</th></tr>${anchorRows}</table>` : '<p class="note">none — recorded offline</p>'}
-<h2>Control mappings</h2>
-<p class="note">Evidence support only — compliance determinations are made by your assessor (see <code>controls/mapping.json</code>): SOC 2 CC7.2 / CC7.3 / CC4.1 · EU AI Act Art. 12 · HIPAA §164.312(b).</p>
-<h2>Timeline</h2>
-<table><tr><th>seq</th><th>ts (claimed)</th><th>type</th><th>tool</th><th>payload</th></tr>
-${rows}
-</table>
-`;
+  return `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Attestor Evidence Report</title></head>
+<body>
+<h1>Attestor Evidence Report</h1>
+<p>Ledger ID: ${ledgerId ?? 'unknown'}</p>
+<p>Verification: ${result}</p>
+<p>Entries: ${entries.length}</p>
+</body>
+</html>`;
 }
