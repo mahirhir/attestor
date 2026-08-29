@@ -28,7 +28,8 @@
     "build": "tsc -p tsconfig.json",
     "test": "node --test --test-concurrency=1 \"test/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "prepare": "tsc -p tsconfig.json"
+    "prepare": "tsc -p tsconfig.json",
+    "benchmark": "node benchmark/measure.ts"
   },
   "dependencies": {
     "canonicalize": "3.0.0"
