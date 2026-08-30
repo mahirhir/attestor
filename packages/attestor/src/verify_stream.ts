@@ -82,7 +82,7 @@ export async function verifyLedgerStream(
       }
     }
 
-    const core = coreOf(entry)
+    const core = coreOf(entry as unknown as Record<string, unknown>)
     const computedHash = hashCore(core)
     if (entry.hash !== computedHash) {
       findings.push({
@@ -92,14 +92,17 @@ export async function verifyLedgerStream(
       })
     }
 
-    if (!pubKeyObj && entry.pub) {
+    if (!pubKeyObj && entry.type === 'genesis' && entry.payload) {
       try {
-        pubKeyObj = createPublicKey(entry.pub)
+        const gen = JSON.parse(entry.payload) as { public_key_pem?: string }
+        if (gen.public_key_pem) {
+          pubKeyObj = createPublicKey(gen.public_key_pem)
+        }
       } catch (err) {
         findings.push({
           seq: entry.seq,
           check: 'SIG',
-          reason: `invalid public key format: ${(err as Error).message}`,
+          reason: `invalid public key format in genesis: ${(err as Error).message}`,
         })
       }
     }

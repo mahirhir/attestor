@@ -48,17 +48,198 @@ export async function runExport(argv: string[]): Promise<void> {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
-    options: { out: { type: 'string' } },
+    options: {
+      out: { type: 'string' },
+      format: { type: 'string', default: 'pack' },
+    },
   });
   const ledgerDir = positionals[0];
-  if (ledgerDir === undefined || !existsSync(join(ledgerDir, 'ledger.jsonl'))) {
-    process.stderr.write('attestor: usage: attestor export <ledger-dir> [--out <dir>]\n');
+  if (ledgerDir === undefined) {
+    process.stderr.write('attestor: usage: attestor export <ledger-dir> [--format <pack|ocsf|cef>] [--out <path>]\n');
+    process.exit(2);
+  }
+  const format = (values.format ?? 'pack').toLowerCase();
+  if (format === 'ocsf') {
+    const output = exportOcsf(ledgerDir);
+    if (values.out !== undefined) {
+      writeFileSync(values.out, output);
+      process.stdout.write(`OCSF export written to ${values.out}\n`);
+    } else {
+      process.stdout.write(output);
+    }
+    return;
+  }
+  if (format === 'cef') {
+    const output = exportCef(ledgerDir);
+    if (values.out !== undefined) {
+      writeFileSync(values.out, output);
+      process.stdout.write(`CEF export written to ${values.out}\n`);
+    } else {
+      process.stdout.write(output);
+    }
+    return;
+  }
+  if (format !== 'pack') {
+    process.stderr.write(`attestor: unsupported export format: ${format} (choose: pack, ocsf, cef)\n`);
+    process.exit(2);
+  }
+  if (!existsSync(join(ledgerDir, 'ledger.jsonl')) && !existsSync(join(ledgerDir, 'ledger', 'entries.jsonl'))) {
+    process.stderr.write(`attestor: no ledger found at ${ledgerDir}\n`);
     process.exit(2);
   }
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 17) + 'Z';
   const out = values.out ?? `attestor-pack-${stamp}`;
   const packDir = await buildPack(ledgerDir, out);
   process.stdout.write(`evidence pack written to ${packDir}\n  verify it: attestor verify ${packDir}\n  or follow ${packDir}/VERIFY.md (curl + jq + openssl only)\n`);
+}
+
+export function extractExportEvents(ledgerDir: string): { events: any[]; ledgerId?: string } {
+  const path = existsSync(join(ledgerDir, 'ledger.jsonl'))
+    ? join(ledgerDir, 'ledger.jsonl')
+    : join(ledgerDir, 'ledger', 'entries.jsonl');
+  if (!existsSync(path)) throw new Error(`no ledger found at ${ledgerDir}`);
+  const entries = readEntries(path);
+  let ledgerId: string | undefined;
+  if (entries.length > 0 && entries[0]!.type === 'genesis' && entries[0]!.payload) {
+    try {
+      ledgerId = (JSON.parse(entries[0]!.payload) as { ledger_id?: string }).ledger_id;
+    } catch {}
+  }
+
+  // Collect anchor mappings by checkpoint_seq
+  const anchors: AnchorPayload[] = [];
+  for (const e of entries) {
+    if (e.type === 'anchor' && e.payload) {
+      try {
+        anchors.push(JSON.parse(e.payload) as AnchorPayload);
+      } catch {}
+    }
+  }
+
+  const requests = new Map<string, LedgerEntry>();
+  const key = (e: LedgerEntry) => `${e.session_id} ${e.call_id}`;
+  for (const e of entries) {
+    if (e.type === 'call_request' && e.call_id !== undefined && !requests.has(key(e))) {
+      requests.set(key(e), e);
+    }
+  }
+
+  const events: any[] = [];
+  for (const e of entries) {
+    if (e.type !== 'call_result' || e.call_id === undefined) continue;
+    const req = requests.get(key(e));
+    if (!req) continue;
+    requests.delete(key(e));
+
+    const reqTs = Date.parse(req.ts);
+    const resTs = Date.parse(e.ts);
+    const durationMs = isNaN(reqTs) || isNaN(resTs) ? 0 : Math.max(0, resTs - reqTs);
+    const isError = e.payload?.includes('"error"') || e.payload?.includes('"isError":true');
+
+    // Find nearest covering anchor (first anchor covering this entry)
+    const coveringAnchor = anchors.find((a) => a.checkpoint_seq >= e.seq);
+
+    events.push({
+      tool_name: req.tool?.name ?? 'unknown_tool',
+      call_id: e.call_id,
+      session_id: e.session_id,
+      request_ts: req.ts,
+      response_ts: e.ts,
+      duration_ms: durationMs,
+      status: isError ? 'error' : 'ok',
+      request_payload: req.payload !== undefined ? safeJsonParse(req.payload) : undefined,
+      response_payload: e.payload !== undefined ? safeJsonParse(e.payload) : undefined,
+      request_seq: req.seq,
+      request_hash: req.hash,
+      response_seq: e.seq,
+      response_hash: e.hash,
+      log_index: coveringAnchor?.logIndex,
+      integrated_time: coveringAnchor?.integratedTime,
+      rekor_url: coveringAnchor?.url,
+    });
+  }
+  return { events, ledgerId };
+}
+
+function safeJsonParse(str: string): any {
+  try {
+    return JSON.parse(str);
+  } catch {
+    return str;
+  }
+}
+
+export function exportOcsf(ledgerDir: string): string {
+  const { events, ledgerId } = extractExportEvents(ledgerDir);
+  const lines = events.map((ev) => {
+    const timeMs = !isNaN(Date.parse(ev.request_ts)) ? Date.parse(ev.request_ts) : Date.now();
+    const isOk = ev.status === 'ok';
+    const ocsfRecord = {
+      activity_id: 1,
+      activity_name: 'agent_tool_call',
+      category_uid: 6,
+      category_name: 'Application Activity',
+      class_uid: 6003,
+      class_name: 'API Activity',
+      time: timeMs,
+      severity_id: isOk ? 1 : 4,
+      severity: isOk ? 'Informational' : 'Medium',
+      status_id: isOk ? 1 : 2,
+      status: isOk ? 'Success' : 'Failure',
+      metadata: {
+        version: '1.3.0',
+        product: {
+          name: 'attestor',
+          version: ATTESTOR_VERSION,
+          vendor_name: 'attestor',
+        },
+        uid: ev.request_hash,
+      },
+      api: {
+        operation: ev.tool_name,
+        service: {
+          name: 'mcp',
+        },
+        request: {
+          data: ev.request_payload,
+        },
+        response: {
+          data: ev.response_payload,
+        },
+      },
+      actor: {
+        session: {
+          uid: ev.session_id,
+        },
+      },
+      unmapped: {
+        ledger_id: ledgerId,
+        ledger_seq_req: ev.request_seq,
+        ledger_hash_req: ev.request_hash,
+        ledger_seq_res: ev.response_seq,
+        ledger_hash_res: ev.response_hash,
+        rekor_log_index: ev.log_index,
+        rekor_integrated_time: ev.integrated_time,
+        audit_note:
+          'SIEM copy is an unauthenticated index into the tamper-evident ledger; verify with `attestor verify` using ledger_seq and ledger_hash',
+      },
+    };
+    return JSON.stringify(ocsfRecord);
+  });
+  return lines.length > 0 ? lines.join('\n') + '\n' : '';
+}
+
+export function exportCef(ledgerDir: string): string {
+  const { events, ledgerId } = extractExportEvents(ledgerDir);
+  const lines = events.map((ev) => {
+    const reqTsMs = !isNaN(Date.parse(ev.request_ts)) ? Date.parse(ev.request_ts) : Date.now();
+    const resTsMs = !isNaN(Date.parse(ev.response_ts)) ? Date.parse(ev.response_ts) : reqTsMs + ev.duration_ms;
+    const severity = ev.status === 'ok' ? '1' : '6';
+    const logIdx = ev.log_index !== undefined ? ` cs5=${ev.log_index} cs5Label=rekorLogIndex` : '';
+    const safeMsg = `Agent tool call ${ev.tool_name} (${ev.status}) in session ${ev.session_id}`.replace(/[\\|]/g, ' ');
+    return `CEF:0|attestor|attestor|${ATTESTOR_VERSION}|agent_tool_call|${ev.tool_name}|${severity}|start=${reqTsMs} end=${resTsMs} suser=${ev.session_id} cs1=${ev.request_seq} cs1Label=ledgerSeqReq cs2=${ev.request_hash} cs2Label=ledgerHashReq cs3=${ev.response_seq} cs3Label=ledgerSeqRes cs4=${ev.response_hash} cs4Label=ledgerHashRes${logIdx} msg=${safeMsg}`;
+  });
+  return lines.length > 0 ? lines.join('\n') + '\n' : '';
 }
 
 export async function buildPack(ledgerDir: string, outDir: string): Promise<string> {

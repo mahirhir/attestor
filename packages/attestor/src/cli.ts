@@ -25,7 +25,8 @@ Usage:
   attestor verify <dir> [--online] [--entry N] [--json]
                         [--rekor-pubkey <f>] [--rekor-url <u>]   authenticate anchors with a key you trust
                         [--expect-key <keyid|pem>]                require a known recorder identity
-  attestor export <ledger-dir> [--out <dir>]     write a regulator-ready evidence pack
+  attestor export <ledger-dir> [--format <pack|ocsf|cef>] [--out <path>]
+                                                 write evidence pack or SIEM records (OCSF/CEF)
   attestor redact <ledger-dir> <seq>             strip a payload (chain & sigs stay valid)
   attestor replay <ledger-dir> [--session <id>]  print recorded tool calls
   attestor demo tamper [--live]                  30-second tamper-evidence demo (offline by default)

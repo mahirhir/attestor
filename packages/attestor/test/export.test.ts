@@ -85,3 +85,45 @@ test('redact refuses system entries and double-redaction', async () => {
   redactEntry(ledgerDir, wire.seq);
   assert.throws(() => redactEntry(ledgerDir, wire.seq), /already redacted/);
 });
+
+test('export --format ocsf: emits valid OCSF 1.3.0 records with anchor and ledger traceability', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  const { exportOcsf } = await import('../src/export.ts');
+  const ocsfOutput = exportOcsf(ledgerDir);
+  assert.ok(ocsfOutput.length > 0, 'ocsf output should not be empty');
+
+  const lines = ocsfOutput.trim().split('\n');
+  assert.ok(lines.length >= 1, 'should have at least 1 tool call event');
+  for (const line of lines) {
+    const record = JSON.parse(line);
+    assert.equal(record.class_uid, 6003);
+    assert.equal(record.class_name, 'API Activity');
+    assert.equal(record.category_uid, 6);
+    assert.equal(record.metadata.version, '1.3.0');
+    assert.equal(record.metadata.product.name, 'attestor');
+    assert.ok(record.api.operation, 'operation tool name must exist');
+    assert.ok(record.unmapped.ledger_seq_req !== undefined);
+    assert.ok(record.unmapped.ledger_hash_req);
+    assert.ok(record.unmapped.ledger_seq_res !== undefined);
+    assert.ok(record.unmapped.ledger_hash_res);
+    assert.ok(record.unmapped.audit_note.includes('tamper-evident ledger'));
+  }
+});
+
+test('export --format cef: emits valid Common Event Format records with ledger fields', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  const { exportCef } = await import('../src/export.ts');
+  const cefOutput = exportCef(ledgerDir);
+  assert.ok(cefOutput.length > 0, 'cef output should not be empty');
+
+  const lines = cefOutput.trim().split('\n');
+  assert.ok(lines.length >= 1, 'should have at least 1 tool call event');
+  for (const line of lines) {
+    assert.ok(line.startsWith('CEF:0|attestor|attestor|0.1.0|agent_tool_call|'));
+    assert.ok(line.includes('cs1Label=ledgerSeqReq'));
+    assert.ok(line.includes('cs2Label=ledgerHashReq'));
+    assert.ok(line.includes('cs3Label=ledgerSeqRes'));
+    assert.ok(line.includes('cs4Label=ledgerHashRes'));
+    assert.ok(line.includes('suser='));
+  }
+});
