@@ -1,7 +1,8 @@
 // Tests for key rotation and verification:
 // - happy path rotation across active key changes
 // - anchors generated for checkpoints created before rotation
-// - adversary rotation injection signed by unauthorized key is rejected
+// (the adversarial rotation-injection case lives in tamper.test.ts, per the
+// repository's attack-matrix policy)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKey } from '../src/keys.ts';
@@ -11,7 +12,7 @@ import { writeCheckpoint } from '../src/checkpoint.ts';
 import { buildAnchoredLedger, fakeAnchor } from './helpers.ts';
 
 test('key rotation: entries before and after rotation verify cleanly', async () => {
-  const { dir, ledgerDir, keys: oldKeys, rekor } = buildAnchoredLedger({ calls: 2 });
+  const { ledgerDir, keys: oldKeys, rekor } = buildAnchoredLedger({ calls: 2 });
   const home = process.env.ATTESTOR_HOME!;
 
   // 1. Generate new recorder key
@@ -46,14 +47,15 @@ test('key rotation: entries before and after rotation verify cleanly', async () 
   fakeAnchor(ledgerNew, ckpt2, rekor);
   ledgerNew.close();
 
-  // 4. Verify full ledger
-  const report = await verifyLedger(ledgerDir, { online: false });
-  assert.equal(report.status, 'VALID', `Expected valid report, got ${report.status}: ${report.errors.join(', ')}`);
-  assert.equal(report.signatureStatus, 'VALID');
+  // 4. Verify full ledger: valid rotation must exit 0
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 0, JSON.stringify(report.findings, null, 2));
+  assert.equal(report.result, 'VERIFIED');
+  assert.ok(report.checks.find((c) => c.name === 'SIG')?.ok);
 });
 
 test('key rotation: anchor written after rotation for checkpoint created before rotation verifies', async () => {
-  const { dir, ledgerDir, keys: oldKeys, rekor } = buildAnchoredLedger({ calls: 2 });
+  const { ledgerDir, keys: oldKeys, rekor } = buildAnchoredLedger({ calls: 2 });
   const home = process.env.ATTESTOR_HOME!;
 
   const ledgerOld = Ledger.open(ledgerDir, oldKeys);
@@ -72,27 +74,7 @@ test('key rotation: anchor written after rotation for checkpoint created before 
   fakeAnchor(ledgerNew, preCkpt, rekor);
   ledgerNew.close();
 
-  const report = await verifyLedger(ledgerDir, { online: false });
-  assert.equal(report.status, 'VALID');
-});
-
-test('key rotation: adversary rotation injection signed by unauthorized key is rejected', async () => {
-  const { dir, ledgerDir, keys: oldKeys } = buildAnchoredLedger({ calls: 2 });
-  const home = process.env.ATTESTOR_HOME!;
-
-  const attackerKeys = generateKey(home);
-  const nextKeys = generateKey(home);
-
-  // Attacker attempts to append key_rotation signed with attacker's key (not old active key)
-  const ledgerAttacker = Ledger.open(ledgerDir, attackerKeys);
-  ledgerAttacker.append({
-    type: 'key_rotation',
-    origin: 'system',
-    payload: nextKeys.publicPem,
-  });
-  ledgerAttacker.close();
-
-  const report = await verifyLedger(ledgerDir, { online: false });
-  assert.equal(report.status, 'TAMPERED');
-  assert.match(report.errors.join(' '), /Signature/i);
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 0, JSON.stringify(report.findings, null, 2));
+  assert.equal(report.result, 'VERIFIED');
 });

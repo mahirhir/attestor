@@ -8,9 +8,9 @@ import { join } from 'node:path';
 import { generateKeyPairSync, sign as cryptoSign, createHash } from 'node:crypto';
 import canonicalize from 'canonicalize';
 import { verifyLedger } from '../src/verify.ts';
-import { coreOf, canonicalCoreBytes, hashCore, signCore, genesisPrev, payloadHash, type LedgerEntry } from '../src/ledger.ts';
+import { coreOf, canonicalCoreBytes, hashCore, signCore, genesisPrev, payloadHash, Ledger, type LedgerEntry } from '../src/ledger.ts';
 import { buildPack } from '../src/export.ts';
-import { keyIdOf } from '../src/keys.ts';
+import { generateKey, keyIdOf } from '../src/keys.ts';
 import { hashedRekordBody } from '../src/rekor.ts';
 import { leafHash, merkleRoot } from '../src/merkle.ts';
 import { buildAnchoredLedger, fakeRekor, rekorEntryFor } from './helpers.ts';
@@ -507,4 +507,27 @@ test('--expect-key binds a ledger to a recorder identity the auditor knows', asy
   // a PEM works as well as a key id
   const byPem = await verifyLedger(ledgerDir, { expectKeyId: keys.publicPem });
   assert.equal(byPem.exitCode, 0, JSON.stringify(byPem.findings));
+});
+
+test('adversary rotation injection signed by unauthorized key: exit 1 with SIG finding', async () => {
+  const { ledgerDir } = buildAnchoredLedger({ calls: 2 });
+  const home = process.env.ATTESTOR_HOME!;
+
+  const attackerKeys = generateKey(home);
+  const nextKeys = generateKey(home);
+
+  // Attacker appends key_rotation signed with their own key, not the active
+  // recorder key: the rotation must not take effect and must read as tamper.
+  const ledgerAttacker = Ledger.open(ledgerDir, attackerKeys);
+  ledgerAttacker.append({
+    type: 'key_rotation',
+    origin: 'system',
+    payload: nextKeys.publicPem,
+  });
+  ledgerAttacker.close();
+
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 1);
+  assert.equal(report.result, 'TAMPER DETECTED');
+  assert.ok(report.findings.some((f) => f.check === 'SIG'), JSON.stringify(report.findings, null, 2));
 });
