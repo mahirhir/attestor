@@ -81,7 +81,7 @@ export function fakeAnchor(
   ledger: Ledger,
   ckpt: LedgerEntry,
   rekor: FakeRekor,
-  opts: { integratedTime?: number } = {},
+  opts: { integratedTime?: number; url?: string } = {},
 ): LedgerEntry {
   const artifact = canonicalCoreBytes(coreOf(ckpt as unknown as Record<string, unknown>));
   const bodyObj = hashedRekordBody(artifact, ledger.keys);
@@ -107,7 +107,7 @@ export function fakeAnchor(
     uuid,
     logIndex,
     integratedTime,
-    url: 'https://rekor.fake',
+    url: opts.url ?? 'https://rekor.fake',
   };
   return ledger.append({
     type: 'anchor',

@@ -30,6 +30,20 @@ export class UntrustedRekorKeyError extends Error {}
 /**
  * Pinned SHA-256 SPKI log IDs for official Sigstore Rekor instances
  * (matches logID: sha256(spki_der)).
+ *
+ * Rotation / migration: this is a set, not a single value. When Sigstore
+ * rotates the log key (or shards the log), the new ID is ADDED here and both
+ * remain valid until ledgers anchored under the old key have aged out — so a
+ * pin taken before the rotation still authenticates, and a fresh pin taken
+ * after it does too. Removing an ID is the (rare) revocation act and is a
+ * breaking change by design.
+ *
+ * Custom logs: the allowlist gates ONLY the official public host. Any other
+ * host (a private Rekor, a mock in tests, and also lookalike spellings of the
+ * official domain) is a custom log: the auditor chose it and pinned its key
+ * themselves, and this list makes no claim about it. What the gate prevents
+ * is exactly one thing — a key that is NOT Sigstore's being accepted as if it
+ * were the official log's.
  */
 export const KNOWN_SIGSTORE_REKOR_LOG_IDS: readonly string[] = [
   'c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d', // Sigstore active v1 log
@@ -42,11 +56,33 @@ export function getSpkiFingerprint(pem: string): string {
   return createHash('sha256').update(der).digest('hex');
 }
 
-/** Verify log public key matches pinned Sigstore trust root when targeting public Sigstore Rekor. */
+/**
+ * True when `baseUrl` targets the official public Sigstore Rekor instance.
+ * The comparison is on the WHATWG-canonicalized hostname (lowercased,
+ * IDNA/punycoded) — never on the raw string. Raw matching was bypassable in
+ * both directions: `HTTPS://REKOR.SIGSTORE.DEV` read as a custom log (gate
+ * skipped for the real host), while substring matching promoted lookalike
+ * hosts that merely contained the official name.
+ */
+export function isOfficialSigstoreHost(baseUrl: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(baseUrl).hostname;
+  } catch {
+    return false; // unparsable → cannot be the official host (fetch would fail anyway)
+  }
+  return hostname === new URL(DEFAULT_REKOR_URL).hostname;
+}
+
+/**
+ * Verify a log public key against the pinned Sigstore trust root when (and
+ * only when) `baseUrl` targets the official public Rekor host. Throws
+ * `UntrustedRekorKeyError` — callers must let it surface, not swallow it.
+ */
 export function verifyRekorKeyTrust(baseUrl: string, pem: string): void {
+  if (!isOfficialSigstoreHost(baseUrl)) return; // custom log: the auditor's own trust decision
   const fingerprint = getSpkiFingerprint(pem);
-  const isSigstoreOfficial = baseUrl.trim().replace(/\/+$/, '') === DEFAULT_REKOR_URL || baseUrl.includes('rekor.sigstore.dev');
-  if (isSigstoreOfficial && !KNOWN_SIGSTORE_REKOR_LOG_IDS.includes(fingerprint)) {
+  if (!KNOWN_SIGSTORE_REKOR_LOG_IDS.includes(fingerprint)) {
     throw new UntrustedRekorKeyError(
       `Untrusted Rekor public key for ${baseUrl}: SPKI digest ${fingerprint} does not match any pinned Sigstore trust root key.`,
     );
@@ -334,8 +370,13 @@ async function tryAnchor(
   });
   renameSync(stagedPath, finalPath);
   // pinning the log key is a convenience, not part of the anchor record, so it
-  // happens after the window is closed
-  await pinRekorKey(baseUrl, ledger.dir, home).catch(() => {});
+  // happens after the window is closed. Network failure while pinning is a
+  // missed convenience and stays silent — but an UNTRUSTED key is a trust
+  // failure and must surface loudly, not be swallowed with it. The anchor
+  // entry itself is already recorded and stays valid; what failed is pinning.
+  await pinRekorKey(baseUrl, ledger.dir, home).catch((err) => {
+    if (err instanceof UntrustedRekorKeyError) throw err;
+  });
   return anchorEntry;
 }
 

@@ -23,11 +23,14 @@ import { inclusionProof, leafHash, verifyInclusion } from './merkle.ts';
 import {
   getEntry,
   getLogPublicKey,
+  isOfficialSigstoreHost,
   rekorUrl,
   RekorUnavailableError,
   searchByPublicKey,
+  UntrustedRekorKeyError,
   verifyCheckpointNote,
   verifyRekorInclusion,
+  verifyRekorKeyTrust,
   verifySET,
   type AnchorPayload,
   type RekorEntry,
@@ -619,6 +622,27 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
     //     alongside it? A mismatch is tamper regardless of trust; a match with
     //     no trusted key proves nothing and is reported as unauthenticated.
     const checkKey = trustedRekorPem ?? resolved.artifactRekorPem;
+    // Allowlist at the point of use: when this anchor CLAIMS to come from the
+    // official public Sigstore log, whatever key is about to authenticate it —
+    // an existing host/home pin (possibly a legacy TOFU pin taken before this
+    // gate existed) or the artifact-shipped key — must itself be the official
+    // log key. A rogue pin authenticating an "official log" anchor is forged
+    // evidence, not an unauthenticated anchor. Custom-log anchors are not
+    // gated: the auditor chose and pinned that log themselves.
+    if (checkKey !== undefined && payload.url !== undefined && isOfficialSigstoreHost(payload.url)) {
+      try {
+        verifyRekorKeyTrust(payload.url, checkKey);
+      } catch (err) {
+        if (!(err instanceof UntrustedRekorKeyError)) throw err;
+        findings.push({
+          seq: a.seq,
+          check: 'ANCHOR',
+          reason: `anchor ${a.seq} claims the official Sigstore log but the key available to authenticate it is not Sigstore's: ${err.message}`,
+        });
+        anchorFailures++;
+        continue;
+      }
+    }
     if (checkKey !== undefined) {
       const trusted = trustedRekorPem !== undefined;
       const under = trusted ? 'the trusted log key' : 'the log key shipped with this artifact';
@@ -829,6 +853,12 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
     let liveLogKey: string | undefined;
     try {
       liveLogKey = await getLogPublicKey(trustedUrl);
+      // Allowlist at the online point of use: a key fetched live from the
+      // official host must be the official log key. A substituted key here
+      // (MITM, poisoned resolver) would otherwise authenticate whatever the
+      // attacker anchored. Throws UntrustedRekorKeyError → handled below as a
+      // finding, never swallowed.
+      verifyRekorKeyTrust(trustedUrl, liveLogKey);
       for (const { payload, stored } of anchors) {
         let fresh: RekorEntry;
         try {
@@ -913,7 +943,14 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
       }
     } catch (err) {
       if (err instanceof RekorUnavailableError) rekorUnreachable = true;
-      else throw err;
+      else if (err instanceof UntrustedRekorKeyError) {
+        // The live key failed the trust-root allowlist: nothing it signed can
+        // be believed, so the whole online phase fails rather than proceeding
+        // to "authenticate" anchors under an untrusted key.
+        findings.push({ seq: n - 1, check: 'ANCHOR-ONLINE', reason: err.message });
+        onlineFailures++;
+        liveLogKey = undefined;
+      } else throw err;
     }
     onlineAuthenticatedAll =
       !rekorUnreachable && onlineFailures === 0 && checked === anchors.length && liveLogKey !== undefined;

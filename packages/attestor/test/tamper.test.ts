@@ -11,7 +11,7 @@ import { verifyLedger } from '../src/verify.ts';
 import { coreOf, canonicalCoreBytes, hashCore, signCore, genesisPrev, payloadHash, Ledger, type LedgerEntry } from '../src/ledger.ts';
 import { buildPack } from '../src/export.ts';
 import { keyIdOf, generateKey } from '../src/keys.ts';
-import { hashedRekordBody } from '../src/rekor.ts';
+import { hashedRekordBody, isOfficialSigstoreHost, verifyRekorKeyTrust, UntrustedRekorKeyError } from '../src/rekor.ts';
 import { leafHash, merkleRoot } from '../src/merkle.ts';
 import { writeCheckpoint } from '../src/checkpoint.ts';
 import { buildAnchoredLedger, fakeRekor, fakeAnchor, rekorEntryFor, tmp } from './helpers.ts';
@@ -615,4 +615,67 @@ test('adversary rotation injection signed by unauthorized key: exit 1 with SIG f
   assert.equal(report.exitCode, 1);
   assert.equal(report.result, 'TAMPER DETECTED');
   assert.ok(report.findings.some((f) => f.check === 'SIG'), JSON.stringify(report.findings, null, 2));
+});
+
+// ---- Rekor trust-root allowlist attacks ----------------------------------
+
+/** Anchored ledger whose anchor entry CLAIMS `url`, authenticated by the fake log key (pinned). */
+function anchoredLedgerClaiming(url: string): string {
+  const dir = tmp();
+  const ledgerDir = join(dir, 'ledger');
+  process.env.ATTESTOR_HOME = join(dir, 'home');
+  const keys = generateKey(join(dir, 'home'));
+  const ledger = Ledger.open(ledgerDir, keys);
+  ledger.append({
+    type: 'call_request',
+    origin: 'proxy',
+    call_id: 'call-0',
+    tool: { server: 'toy', name: 'echo' },
+    payload: JSON.stringify({ text: 'hello' }),
+  });
+  const ckpt = writeCheckpoint(ledger);
+  fakeAnchor(ledger, ckpt, fakeRekor(), { url });
+  ledger.close();
+  return ledgerDir;
+}
+
+test('legacy-pin attack: rogue pin authenticating an anchor that claims the official log: exit 1', async () => {
+  // A TOFU-era pin (here: the fake log key, pinned at both anchors/ and the
+  // home dir) is NOT Sigstore's key. An anchor claiming rekor.sigstore.dev
+  // that only such a pin can authenticate is forged evidence, not merely
+  // unauthenticated.
+  const ledgerDir = anchoredLedgerClaiming('https://rekor.sigstore.dev');
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 1, JSON.stringify(report.findings, null, 2));
+  assert.ok(report.findings.some((f) => f.check === 'ANCHOR' && /not Sigstore/.test(f.reason)));
+});
+
+test('URL-spelling attack: uppercase official host spelling does not bypass the gate', async () => {
+  const ledgerDir = anchoredLedgerClaiming('HTTPS://REKOR.SIGSTORE.DEV/');
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 1, JSON.stringify(report.findings, null, 2));
+  assert.ok(report.findings.some((f) => f.check === 'ANCHOR' && /not Sigstore/.test(f.reason)));
+});
+
+test('lookalike host is a custom log, not the official one: auditor-pinned key stands', async () => {
+  // The substring match used to promote this to "official". It is not: it is
+  // some other log the auditor pinned themselves, and the allowlist makes no
+  // claim about it.
+  const ledgerDir = anchoredLedgerClaiming('https://rekor.sigstore.dev.evil.example');
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 0, JSON.stringify(report.findings, null, 2));
+});
+
+test('official-host detection is canonical, not raw string matching', () => {
+  assert.ok(isOfficialSigstoreHost('https://rekor.sigstore.dev'));
+  assert.ok(isOfficialSigstoreHost('HTTPS://REKOR.SIGSTORE.DEV'));
+  assert.ok(isOfficialSigstoreHost('https://rekor.sigstore.dev/'));
+  assert.ok(isOfficialSigstoreHost('https://rekor.sigstore.dev:443/api'));
+  assert.ok(!isOfficialSigstoreHost('https://rekor.sigstore.dev.evil.example'));
+  assert.ok(!isOfficialSigstoreHost('https://evil.example/?rekor.sigstore.dev'));
+  assert.ok(!isOfficialSigstoreHost('not a url'));
+  // and the gate itself follows the same canonicalization
+  const rogue = fakeRekor().publicPem;
+  assert.throws(() => verifyRekorKeyTrust('HTTPS://REKOR.SIGSTORE.DEV', rogue), UntrustedRekorKeyError);
+  assert.doesNotThrow(() => verifyRekorKeyTrust('https://rekor.sigstore.dev.evil.example', rogue));
 });

@@ -88,7 +88,7 @@ interface MockRekor {
   server: Server;
   url: string;
   posts: Record<string, unknown>[];
-  mode: 'ok' | 'dup' | 'down' | 'ratelimit' | 'divergent';
+  mode: 'ok' | 'dup' | 'down' | 'ratelimit' | 'divergent' | 'roguekey';
   close: () => Promise<void>;
 }
 
@@ -136,7 +136,10 @@ function startMockRekor(): Promise<MockRekor> {
         return;
       }
       if (req.method === 'GET' && req.url === '/api/v1/log/publicKey') {
-        res.writeHead(200, { 'Content-Type': 'application/x-pem-file' }).end(rekor.publicPem);
+        // roguekey: the live key endpoint serves a key that never signed
+        // anything in this log (substitution attack at the point of use)
+        const served = state.mode === 'roguekey' ? fakeRekor().publicPem : rekor.publicPem;
+        res.writeHead(200, { 'Content-Type': 'application/x-pem-file' }).end(served);
         return;
       }
       res.writeHead(404).end();
@@ -313,6 +316,29 @@ test('verify --online: full pass against the mock log, then catches divergence',
     const fail = await verifyLedger(join(dir, 'ledger'), { online: true, rekorUrl: mock.url });
     assert.equal(fail.exitCode, 1);
     assert.ok(fail.findings.some((f) => f.check === 'ANCHOR-ONLINE'));
+  } finally {
+    delete process.env.ATTESTOR_HOME;
+    await mock.close();
+  }
+});
+
+test('online-substitution attack: live key endpoint serves a rogue key: exit 1, not authenticated', async () => {
+  const mock = await startMockRekor();
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  process.env.ATTESTOR_HOME = join(dir, 'home');
+  try {
+    const ledger = Ledger.open(join(dir, 'ledger'), keys);
+    ledger.append({ type: 'wire', origin: 'proxy', payload: '"x"' });
+    const ckpt = writeCheckpoint(ledger);
+    await anchorCheckpoint(ledger, ckpt, { baseUrl: mock.url });
+    ledger.close();
+
+    // now the log's key endpoint answers with a key that signed nothing here
+    mock.mode = 'roguekey';
+    const report = await verifyLedger(join(dir, 'ledger'), { online: true, rekorUrl: mock.url });
+    assert.equal(report.exitCode, 1, JSON.stringify(report.findings, null, 2));
+    assert.ok(report.findings.some((f) => f.check === 'ANCHOR-ONLINE'));
   } finally {
     delete process.env.ATTESTOR_HOME;
     await mock.close();
