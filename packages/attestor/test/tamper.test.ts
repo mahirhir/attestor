@@ -3,7 +3,7 @@
 // checks against a simulated Rekor (fake log key pinned at anchors/).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, unlinkSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { generateKeyPairSync, sign as cryptoSign, createHash } from 'node:crypto';
 import canonicalize from 'canonicalize';
@@ -510,37 +510,85 @@ test('--expect-key binds a ledger to a recorder identity the auditor knows', asy
   assert.equal(byPem.exitCode, 0, JSON.stringify(byPem.findings));
 });
 
-test('entry timestamp in the future relative to Rekor integratedTime: exit 1 ANCHOR tamper', async () => {
+// ---- integratedTime cross-check ------------------------------------------
+// All four cases below are SELF-CONSISTENT: entries are written through the
+// real append path and the anchor's SET is signed over the (possibly shifted)
+// integratedTime, so CHAIN/MERKLE/SIG stay green and only the time policy is
+// exercised.
+
+function timeShiftedLedger(integratedTimeShiftSec: number): { dir: string; ledgerDir: string; keys: ReturnType<typeof generateKey>; ledger: Ledger; rekor: ReturnType<typeof fakeRekor> } {
   const dir = tmp();
   const ledgerDir = join(dir, 'ledger');
   process.env.ATTESTOR_HOME = join(dir, 'home');
   const keys = generateKey(join(dir, 'home'));
   const ledger = Ledger.open(ledgerDir, keys);
   const rekor = fakeRekor();
-
-  // Append entry with future timestamp
   ledger.append({
     type: 'call_request',
     origin: 'proxy',
-    call_id: 'call-future',
+    call_id: 'call-t',
     tool: { server: 'toy', name: 'echo' },
-    payload: JSON.stringify({ text: 'future call' }),
+    payload: JSON.stringify({ text: 'hello' }),
   });
-  
-  // Directly manipulate the appended entry to have a future timestamp and re-sign
-  const lines = readLines(ledgerDir);
-  const e = JSON.parse(lines[1]!) as LedgerEntry;
-  e.ts = '2035-01-01T00:00:00.000Z';
-  e.sig = signCore(e, keys.privateKey);
-  lines[1] = JSON.stringify(e);
-  writeLines(ledgerDir, lines);
-
-  // Now write checkpoint and anchor
   const ckpt = writeCheckpoint(ledger);
-  fakeAnchor(ledger, ckpt, rekor);
-  ledger.close();
+  fakeAnchor(ledger, ckpt, rekor, { integratedTime: Math.floor(Date.now() / 1000) + integratedTimeShiftSec });
+  return { dir, ledgerDir, keys, ledger, rekor };
+}
 
+test('long-delay attack: covered entry ts beyond integratedTime skew, authenticated anchor: exit 1', async () => {
+  // The log claims it integrated the checkpoint an hour BEFORE the covered
+  // entry says it was written — impossible with honest clocks.
+  const { ledgerDir, ledger } = timeShiftedLedger(-3600);
+  ledger.close();
   const report = await verifyLedger(ledgerDir);
-  assert.equal(report.exitCode, 1);
+  assert.equal(report.exitCode, 1, JSON.stringify(report.findings, null, 2));
   assert.ok(report.findings.some((f) => f.check === 'ANCHOR' && /is later than covering Rekor anchor/.test(f.reason)));
+  // Isolation: the time policy is the ONLY thing that fired.
+  assert.ok(!report.findings.some((f) => f.check === 'CHAIN' || f.check === 'MERKLE' || f.check === 'SIG'));
+});
+
+test('integratedTime within the skew tolerance: exit 0 (no warning noise)', async () => {
+  const { ledgerDir, ledger } = timeShiftedLedger(-60); // 60s < 300s tolerance
+  ledger.close();
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 0, JSON.stringify(report.findings, null, 2));
+});
+
+test('post-checkpoint entry with future ts is NOT inspected by the integratedTime check', async () => {
+  // A future-dated entry AFTER the anchored checkpoint is outside the covered
+  // prefix [0, tree_size): the anchor makes no claim about it (it lives in the
+  // ANCHOR LAG region), so the time policy must stay silent.
+  const { ledgerDir, keys, ledger } = timeShiftedLedger(0);
+  ledger.append({
+    type: 'call_request',
+    origin: 'proxy',
+    call_id: 'call-post',
+    tool: { server: 'toy', name: 'echo' },
+    payload: JSON.stringify({ text: 'after checkpoint' }),
+  });
+  ledger.close();
+  // Shift the tail entry into the future and re-sign; it is the last line, so
+  // no prev_hash references it and the chain stays intact.
+  const lines = readLines(ledgerDir);
+  const e = JSON.parse(lines[lines.length - 1]!) as LedgerEntry;
+  e.ts = '2035-01-01T00:00:00.000Z';
+  e.hash = hashCore(e);
+  e.sig = signCore(e, keys.privateKey);
+  lines[lines.length - 1] = JSON.stringify(e);
+  writeLines(ledgerDir, lines);
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 0, JSON.stringify(report.findings, null, 2));
+  assert.ok(!report.findings.some((f) => /integratedTime/.test(f.reason)));
+});
+
+test('unauthenticated anchor with a violating integratedTime: exit 4, never tamper', async () => {
+  // Same long-delay ledger, but the auditor has no independently trusted log
+  // key: integratedTime is attacker-controlled metadata and must not be able
+  // to mint an exit-1 verdict. Exit 4 semantics are preserved.
+  const { dir, ledgerDir, ledger } = timeShiftedLedger(-3600);
+  ledger.close();
+  rmSync(join(dir, 'home', 'keys', 'rekor-pub.pem'));
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 4, JSON.stringify(report.findings, null, 2));
+  assert.ok(!report.findings.some((f) => /is later than covering Rekor anchor/.test(f.reason)));
 });

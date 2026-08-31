@@ -161,7 +161,15 @@ Control mappings (SOC 2 CC7.2/CC7.3/CC4.1, EU AI Act Art. 12, HIPAA
   with the key can forge *from theft onward* — but cannot rewrite history
   whose roots are already in Rekor. HSM/TPM support is roadmap, not MVP.
 - **Entry `ts` is a claim** by the local clock. The only trusted time is
-  Rekor's `integratedTime`.
+  Rekor's `integratedTime`. `verify` cross-checks the two, one-directionally:
+  an entry inside an anchored checkpoint's covered prefix whose `ts` is later
+  than that anchor's `integratedTime` by more than 300 s (clock-skew
+  tolerance) is reported as ANCHOR tamper (exit 1) — the log cannot have
+  integrated an entry that had not happened yet. Within the tolerance nothing
+  is reported (drift is indistinguishable from honest clocks; there is no
+  warning tier). The check only runs for anchors whose SET authenticated
+  under an independently trusted log key: on an unauthenticated anchor
+  `integratedTime` is attacker-controlled, so those stay exit 4.
 - **Truncation window**: entries after the last anchored checkpoint
   (≤ 64 entries or ≤ 60 s by default) can be silently dropped. `verify`
   reports this as ANCHOR LAG rather than pretending otherwise.
