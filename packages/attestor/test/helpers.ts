@@ -2,12 +2,12 @@
 // a fake log keypair, so the full ANCHOR verification path runs in tests.
 import canonicalize from 'canonicalize';
 import { createHash, generateKeyPairSync, sign as cryptoSign, type KeyObject } from 'node:crypto';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { attestorHome, generateKey, keysDir, type KeyPair } from '../src/keys.ts';
 import { canonicalCoreBytes, coreOf, Ledger, type LedgerEntry } from '../src/ledger.ts';
-import { hashedRekordBody, type AnchorPayload } from '../src/rekor.ts';
+import { hashedRekordBody, rekorKeyPinName, type AnchorPayload } from '../src/rekor.ts';
 import { leafHash } from '../src/merkle.ts';
 import { writeCheckpoint } from '../src/checkpoint.ts';
 
@@ -93,14 +93,21 @@ export function fakeAnchor(
   const anchorsDir = join(ledger.dir, 'anchors');
   mkdirSync(anchorsDir, { recursive: true });
   writeFileSync(join(anchorsDir, `${ckpt.seq}.json`), JSON.stringify(stored, null, 2));
-  writeFileSync(join(anchorsDir, 'rekor-pub.pem'), rekor.publicPem);
   // Also pin it as the HOST key, standing in for an auditor who trusts this log
   // independently. Without a pin the anchor is unauthenticated (exit 4) — and
   // ATTESTOR_HOME must be set per test, or this would read the developer's real
   // ~/.attestor and make results depend on machine state.
   const pinDir = keysDir(attestorHome());
   mkdirSync(pinDir, { recursive: true });
-  writeFileSync(join(pinDir, 'rekor-pub.pem'), rekor.publicPem);
+  // Mirror real pinning: keyed by log ID, so anchoring twice under two
+  // different logs (a rotation) leaves BOTH keys pinned rather than the second
+  // silently replacing the first. The legacy single-file pin keeps pointing at
+  // the first key seen, exactly as `pinRekorKey` leaves it.
+  for (const d of [anchorsDir, pinDir]) {
+    writeFileSync(join(d, rekorKeyPinName(rekor.logId)), rekor.publicPem);
+    const legacy = join(d, 'rekor-pub.pem');
+    if (!existsSync(legacy)) writeFileSync(legacy, rekor.publicPem);
+  }
   const payload: AnchorPayload = {
     checkpoint_seq: ckpt.seq,
     provider: 'rekor-v1',

@@ -14,6 +14,7 @@ import { writeCheckpoint } from '../src/checkpoint.ts';
 import {
   anchorCheckpoint,
   backoffMs,
+  DEFAULT_REKOR_URL,
   getEntry,
   hashedRekordBody,
   postEntry,
@@ -394,4 +395,48 @@ test('verifyRekorKeyTrust throws UntrustedRekorKeyError for unknown key targetin
     },
     UntrustedRekorKeyError,
   );
+});
+
+test('online gate: a key served for the OFFICIAL host that is not Sigstore\'s fails the trust root', async () => {
+  // The sibling substitution test points `rekorUrl` at localhost, which is a
+  // custom log — so it exits 1 on a bad signature and would still pass if the
+  // exact-official-host online gate were deleted. This seam keeps the auditor's
+  // trusted URL as the real official host (so the gate applies) and redirects
+  // only the transport to the mock. The mock signs everything correctly and is
+  // in 'ok' mode, so a plain signature check would PASS here: the only thing
+  // that can fail is the trust-root allowlist itself.
+  const mock = await startMockRekor();
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  process.env.ATTESTOR_HOME = join(dir, 'home');
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: Parameters<typeof realFetch>[0], init?: Parameters<typeof realFetch>[1]) => {
+    const href = typeof input === 'string' ? input : input instanceof URL ? input.href : (input as Request).url;
+    return realFetch(
+      href.startsWith(DEFAULT_REKOR_URL) ? mock.url + href.slice(DEFAULT_REKOR_URL.length) : href,
+      init,
+    );
+  }) as typeof globalThis.fetch;
+  try {
+    const ledger = Ledger.open(join(dir, 'ledger'), keys);
+    ledger.append({ type: 'wire', origin: 'proxy', payload: '"x"' });
+    const ckpt = writeCheckpoint(ledger);
+    // anchored against the mock as a custom log, so the OFFLINE gate stays out
+    // of this and the finding under test can only come from the online one
+    await anchorCheckpoint(ledger, ckpt, { baseUrl: mock.url });
+    ledger.close();
+
+    const report = await verifyLedger(join(dir, 'ledger'), { online: true, rekorUrl: DEFAULT_REKOR_URL });
+    assert.equal(report.exitCode, 1, JSON.stringify(report.findings, null, 2));
+    assert.ok(
+      report.findings.some(
+        (f) => f.check === 'ANCHOR-ONLINE' && /does not match any pinned Sigstore trust root/.test(f.reason),
+      ),
+      `expected a trust-root finding, got ${JSON.stringify(report.findings, null, 2)}`,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.ATTESTOR_HOME;
+    await mock.close();
+  }
 });

@@ -210,14 +210,20 @@ Control mappings (SOC 2 CC7.2/CC7.3/CC4.1, EU AI Act Art. 12, HIPAA
   It is fetched from `ATTESTOR_REKOR_URL` at the first successful anchor and
   cached at `~/.attestor/keys/rekor-pub.pem`. When the URL targets the
   official public log (canonicalized hostname `rekor.sigstore.dev` — spelling
-  tricks do not change the host), the fetched key must match a built-in
-  Sigstore trust-root allowlist or pinning fails loudly
-  (`UntrustedRekorKeyError`); the same allowlist is enforced wherever a key is
-  used — `verify --online` live fetches, and existing local/home pins
-  (including legacy pins taken before this gate existed) whenever they
-  authenticate an anchor that claims the official log. The allowlist is a set,
-  so a Sigstore key rotation ships as an added ID with both valid during
-  migration. Custom logs are NOT gated: any other host is the auditor's own
+  tricks, uppercase, and a trailing DNS root dot do not change the host), the
+  fetched key must match a built-in Sigstore trust-root allowlist or pinning
+  fails loudly (`UntrustedRekorKeyError`); key material that does not parse
+  fails the same way rather than escaping as a generic crypto error. The same
+  allowlist is enforced wherever a key is used — `verify --online` live
+  fetches, and existing local/home pins (including legacy pins taken before
+  this gate existed) whenever they authenticate an anchor that claims the
+  official log. Pins are a keyring, stored per log ID at
+  `~/.attestor/keys/rekor-pub-<logID>.pem`, so a Sigstore key rotation ships as
+  an added allowlist ID and both keys stay usable during migration: each anchor
+  is verified under the key matching its own `logID`, which is what lets one
+  ledger span a rotation. The single-file `rekor-pub.pem` is kept pointing at
+  the first key seen, so pins taken before the keyring existed still work.
+  Custom logs are NOT gated: any other host is the auditor's own
   trust decision, pinned TOFU as before — if that first fetch was pointed
   somewhere hostile, the pin is hostile. `attestor verify --rekor-pubkey
   <file>` lets an auditor supply their own key either way.

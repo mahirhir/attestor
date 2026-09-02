@@ -24,6 +24,7 @@ import {
   getEntry,
   getLogPublicKey,
   isOfficialSigstoreHost,
+  readRekorKeyring,
   rekorUrl,
   RekorUnavailableError,
   searchByPublicKey,
@@ -124,6 +125,10 @@ interface ResolvedLedger {
   trustedRekorPem: string | undefined;
   /** Rekor log key shipped INSIDE the artifact — NOT trusted to authenticate itself. */
   artifactRekorPem: string | undefined;
+  /** Host-pinned Rekor log keys by log ID, so a rotated log still verifies. */
+  trustedRekorKeyring: Map<string, string>;
+  /** Artifact-shipped Rekor log keys by log ID. Consistency only, never trust. */
+  artifactRekorKeyring: Map<string, string>;
   /** True if a Rekor log key was pinned alongside this ledger (only written after a successful anchor). */
   hadPinnedLogKey: boolean;
   /** Anchors an exported pack's manifest claims to contain. */
@@ -200,18 +205,25 @@ function resolveTarget(target: string): ResolvedLedger {
   const trustedRekorPem = existsSync(hostPin) ? readFileSync(hostPin, 'utf8') : undefined;
   let artifactRekorPem: string | undefined;
   let hadPinnedLogKey = false;
-  for (const p of [
-    join(base, 'anchors', 'rekor-pub.pem'),
-    join(base, 'keys', 'rekor-pub.pem'),
-    join(base, '..', 'anchors', 'rekor-pub.pem'),
-    join(base, '..', 'keys', 'rekor-pub.pem'),
-  ]) {
+  const artifactKeyDirs = [
+    join(base, 'anchors'),
+    join(base, 'keys'),
+    join(base, '..', 'anchors'),
+    join(base, '..', 'keys'),
+  ];
+  for (const p of artifactKeyDirs.map((d) => join(d, 'rekor-pub.pem'))) {
     if (existsSync(p)) {
       artifactRekorPem = readFileSync(p, 'utf8');
       hadPinnedLogKey = true;
       break;
     }
   }
+  // Keyrings, indexed by log ID, so a ledger spanning a log-key rotation can be
+  // verified anchor by anchor. Host and artifact rings stay separate: only the
+  // host ring can authenticate, and an artifact still cannot vouch for itself.
+  const trustedRekorKeyring = readRekorKeyring([keysDir(attestorHome())]);
+  const artifactRekorKeyring = readRekorKeyring(artifactKeyDirs);
+  if (artifactRekorKeyring.size > 0) hadPinnedLogKey = true;
   // The manifest is part of the exhibit; verification should use it rather than
   // let it sit there as decoration an auditor might read and believe.
   let manifestAnchors: ResolvedLedger['manifestAnchors'] = [];
@@ -236,6 +248,8 @@ function resolveTarget(target: string): ResolvedLedger {
     storedAnchorSeqs: [...new Set(storedAnchorSeqs)].sort((a, b) => a - b),
     trustedRekorPem,
     artifactRekorPem,
+    trustedRekorKeyring,
+    artifactRekorKeyring,
     hadPinnedLogKey,
     manifestAnchors,
   };
@@ -530,7 +544,6 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
   // SET/inclusion/note authenticity requires a TRUSTED Rekor log key (auditor-
   // supplied or host-pinned). The key shipped inside the artifact cannot
   // authenticate the artifact, so it is never used for that.
-  const trustedRekorPem = opts.rekorPubPem ?? resolved.trustedRekorPem;
   const anchorEntries = entries.filter((e) => e.type === 'anchor');
   const anchors: { payload: AnchorPayload; stored: RekorEntry & { uuid?: string } }[] = [];
   let anchorFailures = 0;
@@ -621,7 +634,20 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
     //   CONSISTENT — does the anchor at least verify under the key shipped
     //     alongside it? A mismatch is tamper regardless of trust; a match with
     //     no trusted key proves nothing and is reported as unauthenticated.
-    const checkKey = trustedRekorPem ?? resolved.artifactRekorPem;
+    // Pick the key for THIS anchor's log. A ledger may span a log-key rotation,
+    // so its anchors legitimately carry different log IDs and no single key
+    // verifies all of them. An auditor-supplied `--rekor-pub-pem` still wins
+    // outright; otherwise prefer the host pin matching this anchor's log ID and
+    // fall back to the single legacy pin, which is what pre-keyring pins are.
+    const storedLogId = typeof stored.logID === 'string' ? stored.logID : undefined;
+    const trustedForAnchor =
+      opts.rekorPubPem ??
+      (storedLogId !== undefined ? resolved.trustedRekorKeyring.get(storedLogId) : undefined) ??
+      resolved.trustedRekorPem;
+    const artifactForAnchor =
+      (storedLogId !== undefined ? resolved.artifactRekorKeyring.get(storedLogId) : undefined) ??
+      resolved.artifactRekorPem;
+    const checkKey = trustedForAnchor ?? artifactForAnchor;
     // Allowlist at the point of use: when this anchor CLAIMS to come from the
     // official public Sigstore log, whatever key is about to authenticate it —
     // an existing host/home pin (possibly a legacy TOFU pin taken before this
@@ -644,7 +670,7 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
       }
     }
     if (checkKey !== undefined) {
-      const trusted = trustedRekorPem !== undefined;
+      const trusted = trustedForAnchor !== undefined;
       const under = trusted ? 'the trusted log key' : 'the log key shipped with this artifact';
       if (!verifySET(stored, checkKey)) {
         findings.push({

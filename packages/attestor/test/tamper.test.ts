@@ -10,7 +10,7 @@ import canonicalize from 'canonicalize';
 import { verifyLedger } from '../src/verify.ts';
 import { coreOf, canonicalCoreBytes, hashCore, signCore, genesisPrev, payloadHash, Ledger, type LedgerEntry } from '../src/ledger.ts';
 import { buildPack } from '../src/export.ts';
-import { keyIdOf, generateKey } from '../src/keys.ts';
+import { attestorHome, keyIdOf, generateKey, keysDir } from '../src/keys.ts';
 import { hashedRekordBody, isOfficialSigstoreHost, verifyRekorKeyTrust, UntrustedRekorKeyError } from '../src/rekor.ts';
 import { leafHash, merkleRoot } from '../src/merkle.ts';
 import { writeCheckpoint } from '../src/checkpoint.ts';
@@ -587,7 +587,14 @@ test('unauthenticated anchor with a violating integratedTime: exit 4, never tamp
   // to mint an exit-1 verdict. Exit 4 semantics are preserved.
   const { dir, ledgerDir, ledger } = timeShiftedLedger(-3600);
   ledger.close();
-  rmSync(join(dir, 'home', 'keys', 'rekor-pub.pem'));
+  // Host pins are a keyring now, so "the auditor has no trusted log key" means
+  // clearing every pin, not just the legacy single-file one — leaving the
+  // per-log-ID pin behind would still authenticate the anchor and defeat the
+  // exit-4 precondition this test depends on.
+  const homeKeys = join(dir, 'home', 'keys');
+  for (const f of readdirSync(homeKeys)) {
+    if (f.startsWith('rekor-pub') && f.endsWith('.pem')) rmSync(join(homeKeys, f));
+  }
   const report = await verifyLedger(ledgerDir);
   assert.equal(report.exitCode, 4, JSON.stringify(report.findings, null, 2));
   assert.ok(!report.findings.some((f) => /is later than covering Rekor anchor/.test(f.reason)));
@@ -678,4 +685,91 @@ test('official-host detection is canonical, not raw string matching', () => {
   const rogue = fakeRekor().publicPem;
   assert.throws(() => verifyRekorKeyTrust('HTTPS://REKOR.SIGSTORE.DEV', rogue), UntrustedRekorKeyError);
   assert.doesNotThrow(() => verifyRekorKeyTrust('https://rekor.sigstore.dev.evil.example', rogue));
+});
+
+test('trailing-dot attack: the DNS root label does not demote the official host to a custom log', async () => {
+  // WHATWG URL keeps the root dot, so `rekor.sigstore.dev.` used to classify as
+  // a custom log and skip the allowlist entirely — a rogue pin then
+  // authenticated an anchor claiming a DNS-equivalent official endpoint.
+  const ledgerDir = anchoredLedgerClaiming('https://rekor.sigstore.dev.');
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 1, JSON.stringify(report.findings, null, 2));
+  assert.ok(report.findings.some((f) => f.check === 'ANCHOR' && /not Sigstore/.test(f.reason)));
+});
+
+test('percent-encoded trailing dot (%2e) is the same bypass and is closed too', async () => {
+  const ledgerDir = anchoredLedgerClaiming('https://rekor.sigstore.dev%2e/');
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 1, JSON.stringify(report.findings, null, 2));
+  assert.ok(report.findings.some((f) => f.check === 'ANCHOR' && /not Sigstore/.test(f.reason)));
+});
+
+test('root-label normalization covers the spelling variants, and only those', () => {
+  assert.ok(isOfficialSigstoreHost('https://rekor.sigstore.dev.'));
+  assert.ok(isOfficialSigstoreHost('https://rekor.sigstore.dev./'));
+  assert.ok(isOfficialSigstoreHost('https://rekor.sigstore.dev%2e/'));
+  assert.ok(isOfficialSigstoreHost('https://rekor.sigstore.dev%2E/'));
+  assert.ok(isOfficialSigstoreHost('https://REKOR.SIGSTORE.DEV.:443/api'));
+  // An empty label is not a resolvable name and stays a different host.
+  assert.ok(!isOfficialSigstoreHost('https://rekor.sigstore.dev..'));
+  assert.ok(!isOfficialSigstoreHost('https://rekor.sigstore.dev.evil.example.'));
+});
+
+test('malformed official key material is a trust error, not a raw crypto crash', () => {
+  // createPublicKey() throws something generic; if that escapes, the CLI exits
+  // 2 (IO/usage) instead of reporting an exit-1 trust finding.
+  for (const junk of ['', 'not a pem', '-----BEGIN PUBLIC KEY-----\nZZZZ\n-----END PUBLIC KEY-----\n']) {
+    assert.throws(
+      () => verifyRekorKeyTrust('https://rekor.sigstore.dev', junk),
+      UntrustedRekorKeyError,
+      `expected UntrustedRekorKeyError for ${JSON.stringify(junk)}`,
+    );
+  }
+  // A custom log is still the auditor's own decision — not this gate's business.
+  assert.doesNotThrow(() => verifyRekorKeyTrust('https://rekor.example', 'not a pem'));
+});
+
+test('a malformed pinned key for an official-log anchor reports tamper, not an IO error', async () => {
+  const ledgerDir = anchoredLedgerClaiming('https://rekor.sigstore.dev');
+  // Corrupt every pinned copy, host and artifact alike.
+  for (const d of [join(ledgerDir, 'anchors'), keysDir(attestorHome())]) {
+    for (const f of readdirSync(d)) {
+      if (f.startsWith('rekor-pub') && f.endsWith('.pem')) writeFileSync(join(d, f), 'not a pem\n');
+    }
+  }
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 1, JSON.stringify(report.findings, null, 2));
+  assert.ok(report.findings.some((f) => f.check === 'ANCHOR'));
+});
+
+test('key rotation: a ledger spanning two log keys verifies when both are pinned', async () => {
+  // The documented rotation policy requires per-key selection. With a single
+  // PEM pin the second anchor could never verify, because one key was applied
+  // to every anchor.
+  const dir = tmp();
+  const ledgerDir = join(dir, 'ledger');
+  process.env.ATTESTOR_HOME = join(dir, 'home');
+  const keys = generateKey(join(dir, 'home'));
+  const ledger = Ledger.open(ledgerDir, keys);
+  const oldLog = fakeRekor();
+  const newLog = fakeRekor();
+  assert.notEqual(oldLog.logId, newLog.logId);
+
+  ledger.append({ type: 'call_request', origin: 'proxy', call_id: 'c0', tool: { server: 'toy', name: 'echo' }, payload: JSON.stringify({ text: 'before rotation' }) });
+  fakeAnchor(ledger, writeCheckpoint(ledger), oldLog);
+  ledger.append({ type: 'call_request', origin: 'proxy', call_id: 'c1', tool: { server: 'toy', name: 'echo' }, payload: JSON.stringify({ text: 'after rotation' }) });
+  fakeAnchor(ledger, writeCheckpoint(ledger), newLog);
+  ledger.close();
+
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 0, JSON.stringify(report.findings, null, 2));
+
+  // Discrimination: drop the post-rotation key from the auditor's keyring and
+  // that anchor must stop being authenticated. If this still exits 0, the
+  // rotation test above proves nothing.
+  const pinDir = keysDir(attestorHome());
+  unlinkSync(join(pinDir, `rekor-pub-${newLog.logId}.pem`));
+  unlinkSync(join(ledgerDir, 'anchors', `rekor-pub-${newLog.logId}.pem`));
+  const degraded = await verifyLedger(ledgerDir);
+  assert.notEqual(degraded.exitCode, 0, 'removing the rotated key must change the verdict');
 });
