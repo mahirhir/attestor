@@ -33,6 +33,26 @@ import {
   type RekorEntry,
 } from './rekor.ts';
 
+/**
+ * Maximum clock skew tolerance between a local entry `ts` and the covering
+ * anchor's Rekor `integratedTime` (5 minutes — generous for NTP drift).
+ *
+ * Policy (deliberately narrow):
+ * - The check is one-directional: a covered entry claiming a `ts` LATER than
+ *   `integratedTime + skew` is impossible if both clocks are honest (the log
+ *   integrated a commitment to an entry that "hadn't happened yet"), so it is
+ *   reported as ANCHOR tamper (exit 1). Entries far EARLIER than
+ *   `integratedTime` are normal — anchoring always happens after recording.
+ * - Within the tolerance nothing is reported, not even a warning: sub-skew
+ *   differences are indistinguishable from ordinary clock drift and a warning
+ *   would train users to ignore ANCHOR output.
+ * - The check runs ONLY for anchors whose SET was independently authenticated
+ *   (trusted log key). On an unauthenticated anchor `integratedTime` is
+ *   attacker-controlled metadata; acting on it would let a forged anchor
+ *   manufacture a tamper verdict, so those anchors stay in the exit-4 lane.
+ */
+export const MAX_ANCHOR_CLOCK_SKEW_SEC = 300;
+
 export interface TamperFinding {
   seq: number;
   check: 'CHAIN' | 'MERKLE' | 'SIG' | 'ANCHOR' | 'ANCHOR-ONLINE';
@@ -627,8 +647,44 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
         anchorFailures++;
         continue;
       }
-      if (trusted) setChecked++;
-      else unauthenticated++;
+      if (trusted) {
+        setChecked++;
+        // integratedTime cross-check — see MAX_ANCHOR_CLOCK_SKEW_SEC for the
+        // policy. Runs only here, after the SET, inclusion proof and note all
+        // verified under an independently trusted log key: an unauthenticated
+        // integratedTime is attacker-controlled and must never mint a tamper
+        // verdict (unauthenticated anchors keep their exit-4 semantics).
+        if (typeof stored.integratedTime === 'number' && stored.integratedTime > 0) {
+          // The covered prefix is defined by the REFERENCED CHECKPOINT's
+          // tree_size (AnchorPayload itself carries no tree_size). Resolve it
+          // and refuse to guess: an unresolvable size would otherwise make
+          // slice() silently scan the whole ledger, post-checkpoint entries
+          // included.
+          const treeSize = checkpointPayloads.get(payload.checkpoint_seq)?.tree_size;
+          if (typeof treeSize !== 'number' || !Number.isInteger(treeSize) || treeSize < 0 || treeSize > n) {
+            findings.push({
+              seq: a.seq,
+              check: 'ANCHOR',
+              reason: `anchor ${a.seq}: checkpoint ${payload.checkpoint_seq} has no valid integer tree_size, so the prefix covered by integratedTime cannot be determined`,
+            });
+            anchorFailures++;
+          } else {
+            const anchorTimeSec = stored.integratedTime;
+            for (const e of entries.slice(0, treeSize)) {
+              const entryTimeSec = Math.floor(new Date(e.ts).getTime() / 1000);
+              if (entryTimeSec > anchorTimeSec + MAX_ANCHOR_CLOCK_SKEW_SEC) {
+                findings.push({
+                  seq: e.seq,
+                  check: 'ANCHOR',
+                  reason: `entry ${e.seq} timestamp (${e.ts}) is later than covering Rekor anchor ${a.seq} integratedTime (${new Date(anchorTimeSec * 1000).toISOString()}) by more than ${MAX_ANCHOR_CLOCK_SKEW_SEC}s tolerance`,
+                });
+                anchorFailures++;
+                break;
+              }
+            }
+          }
+        }
+      } else unauthenticated++;
     } else {
       // digest matched our recomputed checkpoint, but nothing authenticates it
       unauthenticated++;

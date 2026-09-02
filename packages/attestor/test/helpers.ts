@@ -37,6 +37,7 @@ export function fakeRekor(): FakeRekor {
 export function rekorEntryFor(
   rekor: FakeRekor,
   bodyObj: unknown,
+  integratedTimeOverride?: number,
 ): {
   uuid: string;
   body: string;
@@ -50,7 +51,7 @@ export function rekorEntryFor(
 } {
   const body = Buffer.from(JSON.stringify(bodyObj)).toString('base64');
   const logIndex = rekor.nextIndex++;
-  const integratedTime = Math.floor(Date.now() / 1000);
+  const integratedTime = integratedTimeOverride ?? Math.floor(Date.now() / 1000);
   const uuid = createHash('sha256').update(body).digest('hex');
   const rootHash = leafHash(Buffer.from(body, 'base64')).toString('hex');
   const noteBody = `rekor.fake - 42\n1\n${Buffer.from(rootHash, 'hex').toString('base64')}\n`;
@@ -80,10 +81,14 @@ export function fakeAnchor(
   ledger: Ledger,
   ckpt: LedgerEntry,
   rekor: FakeRekor,
+  opts: { integratedTime?: number } = {},
 ): LedgerEntry {
   const artifact = canonicalCoreBytes(coreOf(ckpt as unknown as Record<string, unknown>));
   const bodyObj = hashedRekordBody(artifact, ledger.keys);
-  const stored = rekorEntryFor(rekor, bodyObj);
+  // The SET is re-signed over whatever integratedTime we use, so an overridden
+  // time still yields a fully authenticated anchor — tests can isolate the
+  // time policy from every signature check.
+  const stored = rekorEntryFor(rekor, bodyObj, opts.integratedTime);
   const { uuid, logIndex, integratedTime } = stored;
   const anchorsDir = join(ledger.dir, 'anchors');
   mkdirSync(anchorsDir, { recursive: true });
