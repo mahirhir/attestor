@@ -439,8 +439,30 @@ export async function anchorCheckpoint(
   }
 }
 
-/** Filename a log key is pinned under, keyed by its log ID (SPKI digest). */
+/**
+ * True for a well-formed Rekor log ID: sha256(SPKI DER), lowercase hex.
+ *
+ * Log IDs arrive inside log responses, so they are attacker-controlled on any
+ * path that reaches a hostile or impersonated log. Nothing derived from one may
+ * touch the filesystem before this returns true.
+ */
+export function isLogId(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+}
+
+/**
+ * Filename a log key is pinned under, keyed by its log ID (SPKI digest).
+ *
+ * Refuses anything that is not a log ID rather than interpolating it: the
+ * result is used as a path segment, and a value carrying `..`, a separator or
+ * a different length is a traversal or a collision with another log's pin.
+ */
 export function rekorKeyPinName(logId: string): string {
+  if (!isLogId(logId)) {
+    throw new UntrustedRekorKeyError(
+      `Refusing to build a pin filename from a malformed Rekor log ID: ${JSON.stringify(logId).slice(0, 80)}`,
+    );
+  }
   return `rekor-pub-${logId}.pem`;
 }
 
@@ -506,10 +528,15 @@ export async function pinRekorKey(
 ): Promise<void> {
   const dir = anchorsDir(ledgerDir);
   const homeKeys = keysDir(home ?? attestorHome());
-  if (logId !== undefined) {
+  // The log ID comes from the log's own response. A malformed one must not
+  // reach a path, and must not be able to satisfy the preflight: skipping here
+  // skips the fetch AND the trust gate below, so an attacker who can make two
+  // chosen paths exist would suppress the check entirely. An unrecognised ID
+  // falls through to the fetch and is gated like any other.
+  if (isLogId(logId)) {
     const name = rekorKeyPinName(logId);
     if (existsSync(join(dir, name)) && existsSync(join(homeKeys, name))) return;
-  } else if (existsSync(join(dir, 'rekor-pub.pem'))) {
+  } else if (logId === undefined && existsSync(join(dir, 'rekor-pub.pem'))) {
     return; // no log ID to distinguish by — preserve the original pin-once behaviour
   }
   const pem = await getLogPublicKey(baseUrl);
