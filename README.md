@@ -198,11 +198,20 @@ Control mappings (SOC 2 CC7.2/CC7.3/CC4.1, EU AI Act Art. 12, HIPAA
   valid. `--expect-key <keyid|pem>` is what turns "this is a coherent ledger"
   into "this is *their* ledger" — get the recorder's public key the way you
   would get any other counterparty key, out of band.
-- **The pinned Rekor key is trust-on-first-use.** It is fetched from
-  `ATTESTOR_REKOR_URL` at the first successful anchor and cached at
-  `~/.attestor/keys/rekor-pub.pem`; it is not checked against a Sigstore trust
-  root. If that first fetch was pointed somewhere hostile, the pin is hostile.
-  `attestor verify --rekor-pubkey <file>` lets an auditor supply their own.
+- **Official Sigstore log keys are checked against a pinned trust root; any
+  other log is still trust-on-first-use.** A key fetched for, or used to
+  authenticate an anchor claiming, an official Sigstore host must match a
+  pinned trust-root digest, or verification fails as a trust finding rather
+  than an unauthenticated anchor. For any **other** host the pin remains
+  trust-on-first-use: it is fetched from `ATTESTOR_REKOR_URL` at the first
+  successful anchor and cached under `~/.attestor/keys/`, and if that first
+  fetch was pointed somewhere hostile, the pin is hostile. Pins are stored per
+  log ID so a ledger can span a log-key rotation, and each anchor is verified
+  under the key whose digest matches its own `logID`. **`verify --online` is
+  the exception:** it fetches the log's single current key and applies it to
+  every anchor, so pre-rotation anchors are not authenticated by `--online`.
+  `attestor verify --rekor-pubkey <file>` lets an auditor supply their own key
+  either way.
 - **Key rotation** is manual (`attestor keys rotate`, old key signs the new
   one into the chain). No revocation list.
 - **Rekor v1** REST API, URL configurable via `ATTESTOR_REKOR_URL`; v1 gets
