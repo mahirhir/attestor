@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { join, basename } from 'node:path';
 import { parseArgs } from 'node:util';
+import { isRekorPinFile } from './keys.ts';
 import { readEntries, type LedgerEntry } from './ledger.ts';
 import { verifyLedger } from './verify.ts';
 import type { AnchorPayload } from './rekor.ts';
@@ -78,7 +79,11 @@ export async function buildPack(ledgerDir: string, outDir: string): Promise<stri
   if (existsSync(anchorsSrc)) {
     for (const f of readdirSync(anchorsSrc)) {
       if (/^\d+\.json$/.test(f)) copyFileSync(join(anchorsSrc, f), join(outDir, 'anchors', 'rekor', f));
-      if (f === 'rekor-pub.pem') copyFileSync(join(anchorsSrc, f), join(outDir, 'keys', 'rekor-pub.pem'));
+      // Every pin, not just the legacy single-file one. A ledger spanning a
+      // log-key rotation has anchors under two log IDs, and the legacy pin
+      // holds only the first key ever seen, so copying it alone ships a pack
+      // whose rotated anchors no auditor can authenticate.
+      if (isRekorPinFile(f)) copyFileSync(join(anchorsSrc, f), join(outDir, 'keys', f));
     }
   }
   for (const e of entries) {
