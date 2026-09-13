@@ -25,6 +25,7 @@ import {
   getLogPublicKey,
   isOfficialSigstoreHost,
   readRekorKeyring,
+  getSpkiFingerprint,
   rekorUrl,
   RekorUnavailableError,
   searchByPublicKey,
@@ -640,13 +641,34 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
     // outright; otherwise prefer the host pin matching this anchor's log ID and
     // fall back to the single legacy pin, which is what pre-keyring pins are.
     const storedLogId = typeof stored.logID === 'string' ? stored.logID : undefined;
+    // A legacy single-file pin predates the keyring and carries no log ID, so
+    // it may only stand in for an anchor whose logID is this key's own SPKI
+    // digest. Using it for any other logID is unsound in both directions: an
+    // honest anchor from a rotated key is verified under the wrong key and
+    // reported as tamper, and an anchor whose logID was edited and whose SET
+    // was re-signed under the legacy key verifies and passes.
+    //
+    // Three outcomes, not two. Key material that will not parse is NOT "no key
+    // for this anchor": it is passed through so the official-host trust gate
+    // below reports it as UntrustedRekorKeyError. Dropping it here would turn
+    // a trust finding back into silence.
+    const legacyFor = (pem: string | undefined): string | undefined => {
+      if (pem === undefined || storedLogId === undefined) return pem;
+      let fingerprint: string;
+      try {
+        fingerprint = getSpkiFingerprint(pem);
+      } catch {
+        return pem;
+      }
+      return fingerprint === storedLogId ? pem : undefined;
+    };
     const trustedForAnchor =
       opts.rekorPubPem ??
       (storedLogId !== undefined ? resolved.trustedRekorKeyring.get(storedLogId) : undefined) ??
-      resolved.trustedRekorPem;
+      legacyFor(resolved.trustedRekorPem);
     const artifactForAnchor =
       (storedLogId !== undefined ? resolved.artifactRekorKeyring.get(storedLogId) : undefined) ??
-      resolved.artifactRekorPem;
+      legacyFor(resolved.artifactRekorPem);
     const checkKey = trustedForAnchor ?? artifactForAnchor;
     // Allowlist at the point of use: when this anchor CLAIMS to come from the
     // official public Sigstore log, whatever key is about to authenticate it —

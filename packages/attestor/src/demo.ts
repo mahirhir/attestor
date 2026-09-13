@@ -175,7 +175,14 @@ function simulateAnchor(ledger: Ledger, ckpt: LedgerEntry): void {
   const body = Buffer.from(JSON.stringify(hashedRekordBody(artifact, ledger.keys))).toString('base64');
   const integratedTime = Math.floor(Date.now() / 1000);
   const logIndex = 0;
-  const logID = 'simulated-offline-log';
+  // A real log's ID is sha256(SPKI DER) of its own key, and key selection binds
+  // an anchor to the key whose fingerprint equals this. A literal placeholder
+  // here made the simulated anchor unauthenticatable except through a fallback
+  // that ignored the log ID, so the demo was exercising a path that should not
+  // exist rather than the path a real anchor takes.
+  const logID = createHash('sha256')
+    .update(fake.publicKey.export({ type: 'spki', format: 'der' }))
+    .digest('hex');
   const uuid = createHash('sha256').update(body).digest('hex');
   const rootHash = leafHash(Buffer.from(body, 'base64')).toString('hex');
   const noteBody = `attestor-demo-simulated - 0\n1\n${Buffer.from(rootHash, 'hex').toString('base64')}\n`;
