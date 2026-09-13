@@ -128,12 +128,25 @@ function warnUnprotected(keyPath: string, why: string): void {
   );
 }
 
+/**
+ * True for any pinned Rekor log key file, legacy or keyed by log ID.
+ *
+ * These are public keys stored in the same directory as recorder private keys.
+ * Recorder key discovery must skip all of them: selecting one yields an
+ * OpenSSL error from deep inside key loading rather than a usable key, and
+ * because pins are written after key generation the newest-first active-key
+ * rule would select a pin in preference to the real signing key.
+ */
+export function isRekorPinFile(name: string): boolean {
+  return name.startsWith('rekor-pub') && name.endsWith('.pem');
+}
+
 /** Key ids, oldest first (mtime order) — the last one is the active key. */
 export function listKeyIds(home: string = attestorHome()): string[] {
   const dir = keysDir(home);
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
-    .filter((f) => f.endsWith('.pem') && f !== 'rekor-pub.pem')
+    .filter((f) => f.endsWith('.pem') && !isRekorPinFile(f))
     .map((f) => ({ id: f.slice(0, -'.pem'.length), mtime: statSync(join(dir, f)).mtimeMs }))
     .sort((a, b) => a.mtime - b.mtime)
     .map((k) => k.id);

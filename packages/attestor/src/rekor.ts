@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import type { KeyPair } from './keys.ts';
-import { attestorHome, keysDir } from './keys.ts';
+import { attestorHome, isRekorPinFile, keysDir } from './keys.ts';
 import {
   canonicalCoreBytes,
   coreOf,
@@ -469,7 +469,7 @@ export function readRekorKeyring(dirs: readonly string[]): Map<string, string> {
       continue;
     }
     for (const name of names) {
-      if (!name.startsWith('rekor-pub') || !name.endsWith('.pem')) continue;
+      if (!isRekorPinFile(name)) continue;
       let pem: string;
       try {
         pem = readFileSync(join(dir, name), 'utf8');
